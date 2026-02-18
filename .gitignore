@@ -1,0 +1,56 @@
+# OS
+.DS_Store
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+
+# Logs
+*.log
+logs/
+/tmp/
+.npm-debug.log*
+.yarn-debug.log*
+.yarn-error.log*
+
+# Runtime / uploads
+uploads/
+
+# Env files
+.env
+.env.*
+
+# Java / Maven
+**/target/
+**/.classpath
+**/.project
+**/.settings/
+**/*.class
+
+# Java tooling
+**/.gradle/
+**/build/
+**/.mvn/wrapper/maven-wrapper.jar
+!**/.mvn/wrapper/maven-wrapper.properties
+
+# Node / Vite
+**/node_modules/
+**/dist/
+**/.vite/
+**/.cache/
+**/.parcel-cache/
+**/.turbo/
+**/.next/
+**/out/
+**/coverage/
+
+# Misc
+*.swp
+*.swo
+
+# Local databases
+*.mv.db
+*.trace.db
+*.sqlite
+*.sqlite3
