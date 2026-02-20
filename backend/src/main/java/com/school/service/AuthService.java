@@ -3,7 +3,10 @@ package com.school.service;
 import com.school.dto.AuthRequest;
 import com.school.dto.AuthResponse;
 import com.school.dto.RegisterRequest;
+import com.school.entity.Role;
 import com.school.entity.User;
+import com.school.repository.StudentRepository;
+import com.school.repository.TeacherRepository;
 import com.school.repository.UserRepository;
 import com.school.util.JwtUtil;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -22,15 +25,20 @@ public class AuthService implements UserDetailsService {
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
     private final JwtUtil jwtUtil;
+    private final StudentRepository studentRepository;
+    private final TeacherRepository teacherRepository;
 
     @Lazy
     @Autowired
     private AuthenticationManager authenticationManager;
 
-    public AuthService(UserRepository userRepository, PasswordEncoder passwordEncoder, JwtUtil jwtUtil) {
+    public AuthService(UserRepository userRepository, PasswordEncoder passwordEncoder, JwtUtil jwtUtil,
+                       StudentRepository studentRepository, TeacherRepository teacherRepository) {
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
         this.jwtUtil = jwtUtil;
+        this.studentRepository = studentRepository;
+        this.teacherRepository = teacherRepository;
     }
 
     @Override
@@ -55,13 +63,7 @@ public class AuthService implements UserDetailsService {
         userRepository.save(user);
         String token = jwtUtil.generateToken(user);
 
-        return AuthResponse.builder()
-                .token(token)
-                .email(user.getEmail())
-                .firstName(user.getFirstName())
-                .lastName(user.getLastName())
-                .role(user.getRole())
-                .build();
+        return buildAuthResponse(user, token);
     }
 
     public AuthResponse login(AuthRequest request) {
@@ -74,12 +76,25 @@ public class AuthService implements UserDetailsService {
 
         String token = jwtUtil.generateToken(user);
 
-        return AuthResponse.builder()
+        return buildAuthResponse(user, token);
+    }
+
+    private AuthResponse buildAuthResponse(User user, String token) {
+        AuthResponse.AuthResponseBuilder builder = AuthResponse.builder()
                 .token(token)
                 .email(user.getEmail())
                 .firstName(user.getFirstName())
                 .lastName(user.getLastName())
-                .role(user.getRole())
-                .build();
+                .role(user.getRole());
+
+        if (user.getRole() == Role.STUDENT) {
+            studentRepository.findByUserId(user.getId())
+                    .ifPresent(s -> builder.studentId(s.getId()));
+        } else if (user.getRole() == Role.TEACHER) {
+            teacherRepository.findByUserId(user.getId())
+                    .ifPresent(t -> builder.teacherId(t.getId()));
+        }
+
+        return builder.build();
     }
 }

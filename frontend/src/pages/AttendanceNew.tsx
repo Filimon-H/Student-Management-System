@@ -23,6 +23,11 @@ type ViewMode = 'daily' | 'monthly';
 export default function AttendancePage() {
   const { user } = useAuth();
   const canEdit = user?.role === 'ADMIN' || user?.role === 'TEACHER';
+  const isStudent = user?.role === 'STUDENT';
+
+  // Student-only state
+  const [myAttendance, setMyAttendance] = useState<Attendance[]>([]);
+  const [myLoading, setMyLoading] = useState(false);
 
   const [classes, setClasses] = useState<SchoolClass[]>([]);
   const [students, setStudents] = useState<Student[]>([]);
@@ -48,6 +53,14 @@ export default function AttendancePage() {
   const [success, setSuccess] = useState('');
 
   useEffect(() => {
+    if (isStudent && user?.studentId) {
+      setMyLoading(true);
+      attendanceApi.getByStudent(user.studentId)
+        .then(res => setMyAttendance(res.data))
+        .catch(() => setError('Failed to load attendance'))
+        .finally(() => setMyLoading(false));
+      return;
+    }
     Promise.all([classApi.getAll(), studentApi.getAll()])
       .then(([c, s]) => { setClasses(c.data); setStudents(s.data); })
       .catch(() => setError('Failed to load data'));
@@ -118,6 +131,68 @@ export default function AttendancePage() {
   const classStudents = students.filter(s => s.classId === Number(selectedClass));
   const alertCount = monthlySummary.filter(s => s.lowAttendanceAlert).length;
   const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+  // Student-only view
+  if (isStudent) {
+    const myPresent = myAttendance.filter(a => a.status === 'PRESENT').length;
+    const myRate = myAttendance.length > 0 ? Math.round((myPresent / myAttendance.length) * 1000) / 10 : 0;
+    return (
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">My Attendance</h1>
+          <p className="text-sm text-gray-500 mt-1">Your attendance records</p>
+        </div>
+        {/* Summary */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="bg-white rounded-2xl border border-gray-100 p-6">
+            <p className="text-xs text-gray-500 font-medium mb-1">Attendance Rate</p>
+            <p className={`text-3xl font-bold ${myRate >= 75 ? 'text-green-600' : 'text-red-600'}`}>{myRate}%</p>
+          </div>
+          <div className="bg-white rounded-2xl border border-gray-100 p-6">
+            <p className="text-xs text-gray-500 font-medium mb-1">Days Present</p>
+            <p className="text-3xl font-bold text-green-600">{myPresent}</p>
+          </div>
+          <div className="bg-white rounded-2xl border border-gray-100 p-6">
+            <p className="text-xs text-gray-500 font-medium mb-1">Total Days</p>
+            <p className="text-3xl font-bold text-gray-900">{myAttendance.length}</p>
+          </div>
+        </div>
+        {/* Records */}
+        <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+          {myLoading ? (
+            <div className="flex items-center justify-center h-40"><div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600" /></div>
+          ) : myAttendance.length === 0 ? (
+            <div className="text-center py-12 text-gray-400">No attendance records yet.</div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 border-b border-gray-100">
+                <tr>
+                  <th className="text-left px-5 py-3 font-medium text-gray-500">Date</th>
+                  <th className="text-left px-5 py-3 font-medium text-gray-500">Class</th>
+                  <th className="text-left px-5 py-3 font-medium text-gray-500">Status</th>
+                  <th className="text-left px-5 py-3 font-medium text-gray-500">Remarks</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-50">
+                {myAttendance.map(a => (
+                  <tr key={a.id} className="hover:bg-gray-50">
+                    <td className="px-5 py-3 text-gray-900">{a.date}</td>
+                    <td className="px-5 py-3 text-gray-500">{a.className}</td>
+                    <td className="px-5 py-3">
+                      <span className={`inline-flex items-center gap-1 text-xs px-2.5 py-0.5 rounded-full font-medium ${STATUS_COLORS[a.status]}`}>
+                        {STATUS_ICONS[a.status]}{a.status}
+                      </span>
+                    </td>
+                    <td className="px-5 py-3 text-gray-400">{a.remarks || '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">

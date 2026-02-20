@@ -16,9 +16,14 @@ export default function Grades() {
   const [form, setForm] = useState({ studentId: '', subjectId: '', score: '', maxScore: '100', examName: '', examDate: '', remarks: '' });
 
   const canEdit = user?.role === 'ADMIN' || user?.role === 'TEACHER';
+  const isStudent = user?.role === 'STUDENT';
 
   useEffect(() => {
-    studentApi.getAll().then((res) => setStudents(res.data));
+    if (isStudent && user?.studentId) {
+      setSelectedStudent(String(user.studentId));
+    } else {
+      studentApi.getAll().then((res) => setStudents(res.data));
+    }
     subjectApi.getAll().then((res) => setSubjects(res.data));
   }, []);
 
@@ -71,15 +76,17 @@ export default function Grades() {
   return (
     <div>
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
-        <h1 className="text-2xl font-bold">Grades</h1>
+        <h1 className="text-2xl font-bold">{isStudent ? 'My Grades' : 'Grades'}</h1>
         <div className="flex gap-3 items-end">
-          <div>
-            <label className="block text-sm font-medium mb-1">Student</label>
-            <select value={selectedStudent} onChange={(e) => setSelectedStudent(e.target.value)} className="px-3 py-2 border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary min-w-[200px]">
-              <option value="">Select a student</option>
-              {students.map((s) => <option key={s.id} value={s.id}>{s.firstName} {s.lastName}</option>)}
-            </select>
-          </div>
+          {!isStudent && (
+            <div>
+              <label className="block text-sm font-medium mb-1">Student</label>
+              <select value={selectedStudent} onChange={(e) => setSelectedStudent(e.target.value)} className="px-3 py-2 border rounded-lg text-sm outline-none focus:ring-2 focus:ring-primary min-w-[200px]">
+                <option value="">Select a student</option>
+                {students.map((s) => <option key={s.id} value={s.id}>{s.firstName} {s.lastName}</option>)}
+              </select>
+            </div>
+          )}
           {canEdit && selectedStudent && (
             <button onClick={openCreate} className="flex items-center gap-2 bg-primary text-primary-foreground px-4 py-2 rounded-lg text-sm font-medium hover:opacity-90 transition whitespace-nowrap">
               <Plus size={16} /> Add Grade

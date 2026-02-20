@@ -1,13 +1,19 @@
 package com.school.controller;
 
 import com.school.dto.StudentDTO;
+import com.school.entity.Student;
+import com.school.entity.User;
+import com.school.repository.StudentRepository;
 import com.school.service.StudentService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
+
+import java.util.Optional;
 
 import java.util.List;
 
@@ -17,6 +23,17 @@ import java.util.List;
 public class StudentController {
 
     private final StudentService studentService;
+    private final StudentRepository studentRepository;
+
+    @GetMapping("/me")
+    @PreAuthorize("hasRole('STUDENT')")
+    public ResponseEntity<StudentDTO> getMyProfile(@AuthenticationPrincipal User user) {
+        Optional<Student> student = studentRepository.findByUserId(user.getId());
+        if (student.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(studentService.getStudentById(student.get().getId()));
+    }
 
     @GetMapping
     public ResponseEntity<List<StudentDTO>> getAllStudents() {

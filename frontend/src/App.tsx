@@ -14,6 +14,7 @@ import Terms from './pages/Terms';
 import Enrollments from './pages/Enrollments';
 import Assignments from './pages/Assignments';
 import SmartGrades from './pages/SmartGrades';
+import MyProfile from './pages/MyProfile';
 
 export default function App() {
   return (
@@ -29,16 +30,17 @@ export default function App() {
             }
           >
             <Route path="/dashboard" element={<Dashboard />} />
-            <Route path="/students" element={<Students />} />
-            <Route path="/teachers" element={<Teachers />} />
-            <Route path="/classes" element={<Classes />} />
-            <Route path="/subjects" element={<Subjects />} />
+            <Route path="/students" element={<ProtectedRoute allowedRoles={['ADMIN', 'TEACHER']}><Students /></ProtectedRoute>} />
+            <Route path="/teachers" element={<ProtectedRoute allowedRoles={['ADMIN']}><Teachers /></ProtectedRoute>} />
+            <Route path="/classes" element={<ProtectedRoute allowedRoles={['ADMIN', 'TEACHER']}><Classes /></ProtectedRoute>} />
+            <Route path="/subjects" element={<ProtectedRoute allowedRoles={['ADMIN']}><Subjects /></ProtectedRoute>} />
             <Route path="/attendance" element={<AttendancePage />} />
             <Route path="/grades" element={<Grades />} />
-            <Route path="/smart-grades" element={<SmartGrades />} />
-            <Route path="/terms" element={<Terms />} />
-            <Route path="/enrollments" element={<Enrollments />} />
-            <Route path="/assignments" element={<Assignments />} />
+            <Route path="/smart-grades" element={<ProtectedRoute allowedRoles={['ADMIN', 'TEACHER']}><SmartGrades /></ProtectedRoute>} />
+            <Route path="/terms" element={<ProtectedRoute allowedRoles={['ADMIN', 'TEACHER']}><Terms /></ProtectedRoute>} />
+            <Route path="/enrollments" element={<ProtectedRoute allowedRoles={['ADMIN']}><Enrollments /></ProtectedRoute>} />
+            <Route path="/assignments" element={<ProtectedRoute allowedRoles={['ADMIN']}><Assignments /></ProtectedRoute>} />
+            <Route path="/my-profile" element={<ProtectedRoute allowedRoles={['STUDENT']}><MyProfile /></ProtectedRoute>} />
           </Route>
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>

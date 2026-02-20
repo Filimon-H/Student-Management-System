@@ -18,6 +18,7 @@ export const dashboardApi = {
 export const studentApi = {
   getAll: () => api.get<Student[]>('/students'),
   getById: (id: number) => api.get<Student>(`/students/${id}`),
+  getMe: () => api.get<Student>('/students/me'),
   search: (query: string) => api.get<Student[]>(`/students/search?query=${query}`),
   getByClass: (classId: number) => api.get<Student[]>(`/students/class/${classId}`),
   create: (data: Partial<Student>) => api.post<Student>('/students', data),

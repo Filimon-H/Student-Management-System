@@ -4,6 +4,8 @@ export interface User {
   lastName: string;
   role: 'ADMIN' | 'TEACHER' | 'STUDENT';
   token: string;
+  studentId?: number;
+  teacherId?: number;
 }
 
 export interface AuthResponse {
@@ -12,6 +14,8 @@ export interface AuthResponse {
   firstName: string;
   lastName: string;
   role: 'ADMIN' | 'TEACHER' | 'STUDENT';
+  studentId?: number;
+  teacherId?: number;
 }
 
 export interface Student {
@@ -188,9 +192,21 @@ export interface Grade {
   percentage?: number;
 }
 
+export interface RecentStudent {
+  id: number;
+  name: string;
+  className: string;
+  email: string;
+}
+
 export interface DashboardStats {
   totalStudents: number;
   totalTeachers: number;
   totalClasses: number;
   totalSubjects: number;
+  attendanceRate: number;
+  totalEnrollments: number;
+  totalAssessments: number;
+  recentStudents: RecentStudent[];
+  weeklyAttendance: number[];
 }

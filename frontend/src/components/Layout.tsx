@@ -16,10 +16,12 @@ import {
   UserCheck,
   ClipboardList,
   Award,
+  UserCircle,
 } from 'lucide-react';
 
 const navItems = [
   { label: 'Dashboard', path: '/dashboard', icon: LayoutDashboard, roles: ['ADMIN', 'TEACHER', 'STUDENT'] },
+  { label: 'My Profile', path: '/my-profile', icon: UserCircle, roles: ['STUDENT'] },
   { label: 'Students', path: '/students', icon: Users, roles: ['ADMIN', 'TEACHER'] },
   { label: 'Teachers', path: '/teachers', icon: GraduationCap, roles: ['ADMIN'] },
   { label: 'Classes', path: '/classes', icon: School, roles: ['ADMIN', 'TEACHER'] },

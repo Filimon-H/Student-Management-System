@@ -1,13 +1,19 @@
 package com.school.controller;
 
 import com.school.dto.TeacherDTO;
+import com.school.entity.Teacher;
+import com.school.entity.User;
+import com.school.repository.TeacherRepository;
 import com.school.service.TeacherService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
+
+import java.util.Optional;
 
 import java.util.List;
 
@@ -17,6 +23,17 @@ import java.util.List;
 public class TeacherController {
 
     private final TeacherService teacherService;
+    private final TeacherRepository teacherRepository;
+
+    @GetMapping("/me")
+    @PreAuthorize("hasRole('TEACHER')")
+    public ResponseEntity<TeacherDTO> getMyProfile(@AuthenticationPrincipal User user) {
+        Optional<Teacher> teacher = teacherRepository.findByUserId(user.getId());
+        if (teacher.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(teacherService.getTeacherById(teacher.get().getId()));
+    }
 
     @GetMapping
     public ResponseEntity<List<TeacherDTO>> getAllTeachers() {
