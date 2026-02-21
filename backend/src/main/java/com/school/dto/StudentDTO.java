@@ -32,4 +32,6 @@ public class StudentDTO {
     private String guardianPhone;
     private Long classId;
     private String className;
+    private Long sectionId;
+    private String sectionName;
 }

@@ -34,13 +34,13 @@ public class TeacherAssignmentController {
     }
 
     @PostMapping
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")
     public ResponseEntity<TeacherAssignmentDTO> assign(@Valid @RequestBody TeacherAssignmentDTO dto) {
         return new ResponseEntity<>(assignmentService.assign(dto), HttpStatus.CREATED);
     }
 
     @DeleteMapping("/{id}")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")
     public ResponseEntity<Void> delete(@PathVariable Long id) {
         assignmentService.delete(id);
         return ResponseEntity.noContent().build();

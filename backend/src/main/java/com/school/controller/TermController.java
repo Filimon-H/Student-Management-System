@@ -34,25 +34,25 @@ public class TermController {
     }
 
     @PostMapping
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")
     public ResponseEntity<TermDTO> create(@Valid @RequestBody TermDTO dto) {
         return new ResponseEntity<>(termService.create(dto), HttpStatus.CREATED);
     }
 
     @PutMapping("/{id}")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")
     public ResponseEntity<TermDTO> update(@PathVariable Long id, @Valid @RequestBody TermDTO dto) {
         return ResponseEntity.ok(termService.update(id, dto));
     }
 
     @PutMapping("/{id}/activate")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")
     public ResponseEntity<TermDTO> activate(@PathVariable Long id) {
         return ResponseEntity.ok(termService.setActive(id));
     }
 
     @DeleteMapping("/{id}")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")
     public ResponseEntity<Void> delete(@PathVariable Long id) {
         termService.delete(id);
         return ResponseEntity.noContent().build();

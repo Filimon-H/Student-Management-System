@@ -2,9 +2,11 @@ package com.school.service;
 
 import com.school.dto.SchoolClassDTO;
 import com.school.dto.StudentDTO;
+import com.school.entity.ClassType;
 import com.school.entity.SchoolClass;
 import com.school.entity.Teacher;
 import com.school.exception.ResourceNotFoundException;
+import com.school.repository.ClassTypeRepository;
 import com.school.repository.SchoolClassRepository;
 import com.school.repository.TeacherRepository;
 import lombok.RequiredArgsConstructor;
@@ -20,6 +22,7 @@ public class SchoolClassService {
 
     private final SchoolClassRepository schoolClassRepository;
     private final TeacherRepository teacherRepository;
+    private final ClassTypeRepository classTypeRepository;
 
     public List<SchoolClassDTO> getAllClasses() {
         return schoolClassRepository.findAll().stream()
@@ -45,6 +48,12 @@ public class SchoolClassService {
                 .section(dto.getSection())
                 .build();
 
+        if (dto.getClassTypeId() != null) {
+            ClassType ct = classTypeRepository.findById(dto.getClassTypeId())
+                    .orElseThrow(() -> new ResourceNotFoundException("ClassType not found with id: " + dto.getClassTypeId()));
+            schoolClass.setClassType(ct);
+        }
+
         if (dto.getHomeroomTeacherId() != null) {
             Teacher teacher = teacherRepository.findById(dto.getHomeroomTeacherId())
                     .orElseThrow(() -> new ResourceNotFoundException("Teacher not found with id: " + dto.getHomeroomTeacherId()));
@@ -62,6 +71,14 @@ public class SchoolClassService {
         schoolClass.setName(dto.getName());
         schoolClass.setGrade(dto.getGrade());
         schoolClass.setSection(dto.getSection());
+
+        if (dto.getClassTypeId() != null) {
+            ClassType ct = classTypeRepository.findById(dto.getClassTypeId())
+                    .orElseThrow(() -> new ResourceNotFoundException("ClassType not found with id: " + dto.getClassTypeId()));
+            schoolClass.setClassType(ct);
+        } else {
+            schoolClass.setClassType(null);
+        }
 
         if (dto.getHomeroomTeacherId() != null) {
             Teacher teacher = teacherRepository.findById(dto.getHomeroomTeacherId())
@@ -92,10 +109,13 @@ public class SchoolClassService {
                 .name(schoolClass.getName())
                 .grade(schoolClass.getGrade())
                 .section(schoolClass.getSection())
+                .classTypeId(schoolClass.getClassType() != null ? schoolClass.getClassType().getId() : null)
+                .classTypeName(schoolClass.getClassType() != null ? schoolClass.getClassType().getName() : null)
                 .homeroomTeacherId(schoolClass.getHomeroomTeacher() != null ? schoolClass.getHomeroomTeacher().getId() : null)
                 .homeroomTeacherName(schoolClass.getHomeroomTeacher() != null ?
                         schoolClass.getHomeroomTeacher().getFirstName() + " " + schoolClass.getHomeroomTeacher().getLastName() : null)
                 .studentCount(schoolClass.getStudents() != null ? schoolClass.getStudents().size() : 0)
+                .sectionCount(schoolClass.getSections() != null ? schoolClass.getSections().size() : 0)
                 .build();
     }
 

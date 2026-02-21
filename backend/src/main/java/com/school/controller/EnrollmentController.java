@@ -35,19 +35,19 @@ public class EnrollmentController {
     }
 
     @PostMapping
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")
     public ResponseEntity<EnrollmentDTO> enroll(@Valid @RequestBody EnrollmentDTO dto) {
         return new ResponseEntity<>(enrollmentService.enroll(dto), HttpStatus.CREATED);
     }
 
     @PutMapping("/{id}/status")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")
     public ResponseEntity<EnrollmentDTO> updateStatus(@PathVariable Long id, @RequestParam EnrollmentStatus status) {
         return ResponseEntity.ok(enrollmentService.updateStatus(id, status));
     }
 
     @DeleteMapping("/{id}")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")
     public ResponseEntity<Void> delete(@PathVariable Long id) {
         enrollmentService.delete(id);
         return ResponseEntity.noContent().build();

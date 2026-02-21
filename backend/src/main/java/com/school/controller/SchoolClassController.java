@@ -29,19 +29,19 @@ public class SchoolClassController {
     }
 
     @PostMapping
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")
     public ResponseEntity<SchoolClassDTO> createClass(@Valid @RequestBody SchoolClassDTO dto) {
         return new ResponseEntity<>(schoolClassService.createClass(dto), HttpStatus.CREATED);
     }
 
     @PutMapping("/{id}")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")
     public ResponseEntity<SchoolClassDTO> updateClass(@PathVariable Long id, @Valid @RequestBody SchoolClassDTO dto) {
         return ResponseEntity.ok(schoolClassService.updateClass(id, dto));
     }
 
     @DeleteMapping("/{id}")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")
     public ResponseEntity<Void> deleteClass(@PathVariable Long id) {
         schoolClassService.deleteClass(id);
         return ResponseEntity.noContent().build();

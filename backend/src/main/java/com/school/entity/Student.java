@@ -39,6 +39,10 @@ public class Student {
     @JoinColumn(name = "class_id")
     private SchoolClass schoolClass;
 
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "section_id")
+    private Section section;
+
     @OneToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "user_id")
     private User user;

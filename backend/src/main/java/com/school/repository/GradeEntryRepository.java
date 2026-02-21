@@ -18,4 +18,7 @@ public interface GradeEntryRepository extends JpaRepository<GradeEntry, Long> {
 
     @Query("SELECT ge FROM GradeEntry ge JOIN ge.assessment a WHERE a.term.id = :termId AND a.subject.id = :subjectId AND ge.student.id = :studentId")
     List<GradeEntry> findByTermIdAndSubjectIdAndStudentId(@Param("termId") Long termId, @Param("subjectId") Long subjectId, @Param("studentId") Long studentId);
+
+    @Query("SELECT ge FROM GradeEntry ge JOIN ge.assessment a WHERE a.term.id = :termId AND a.schoolClass.id = :classId")
+    List<GradeEntry> findByTermIdAndClassId(@Param("termId") Long termId, @Param("classId") Long classId);
 }

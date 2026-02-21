@@ -35,19 +35,19 @@ public class AssessmentController {
     }
 
     @PostMapping
-    @PreAuthorize("hasAnyRole('ADMIN', 'TEACHER')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN','TEACHER')")
     public ResponseEntity<AssessmentDTO> create(@Valid @RequestBody AssessmentDTO dto) {
         return new ResponseEntity<>(assessmentService.create(dto), HttpStatus.CREATED);
     }
 
     @PutMapping("/{id}")
-    @PreAuthorize("hasAnyRole('ADMIN', 'TEACHER')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN','TEACHER')")
     public ResponseEntity<AssessmentDTO> update(@PathVariable Long id, @Valid @RequestBody AssessmentDTO dto) {
         return ResponseEntity.ok(assessmentService.update(id, dto));
     }
 
     @DeleteMapping("/{id}")
-    @PreAuthorize("hasAnyRole('ADMIN', 'TEACHER')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN','TEACHER')")
     public ResponseEntity<Void> delete(@PathVariable Long id) {
         assessmentService.delete(id);
         return ResponseEntity.noContent().build();
@@ -59,13 +59,13 @@ public class AssessmentController {
     }
 
     @PostMapping("/grades")
-    @PreAuthorize("hasAnyRole('ADMIN', 'TEACHER')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN','TEACHER')")
     public ResponseEntity<GradeEntryDTO> saveGradeEntry(@Valid @RequestBody GradeEntryDTO dto) {
         return new ResponseEntity<>(assessmentService.saveGradeEntry(dto), HttpStatus.CREATED);
     }
 
     @DeleteMapping("/grades/{id}")
-    @PreAuthorize("hasAnyRole('ADMIN', 'TEACHER')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN','TEACHER')")
     public ResponseEntity<Void> deleteGradeEntry(@PathVariable Long id) {
         assessmentService.deleteGradeEntry(id);
         return ResponseEntity.noContent().build();

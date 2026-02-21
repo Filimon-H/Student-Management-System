@@ -34,19 +34,19 @@ public class GradeController {
     }
 
     @PostMapping
-    @PreAuthorize("hasAnyRole('ADMIN', 'TEACHER')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN','TEACHER')")
     public ResponseEntity<GradeDTO> createGrade(@Valid @RequestBody GradeDTO dto) {
         return new ResponseEntity<>(gradeService.createGrade(dto), HttpStatus.CREATED);
     }
 
     @PutMapping("/{id}")
-    @PreAuthorize("hasAnyRole('ADMIN', 'TEACHER')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN','TEACHER')")
     public ResponseEntity<GradeDTO> updateGrade(@PathVariable Long id, @Valid @RequestBody GradeDTO dto) {
         return ResponseEntity.ok(gradeService.updateGrade(id, dto));
     }
 
     @DeleteMapping("/{id}")
-    @PreAuthorize("hasAnyRole('ADMIN', 'TEACHER')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN','TEACHER')")
     public ResponseEntity<Void> deleteGrade(@PathVariable Long id) {
         gradeService.deleteGrade(id);
         return ResponseEntity.noContent().build();

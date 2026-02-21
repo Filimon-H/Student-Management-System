@@ -27,10 +27,18 @@ public class SchoolClass {
     private String section;
 
     @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "class_type_id")
+    private ClassType classType;
+
+    @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "homeroom_teacher_id")
     private Teacher homeroomTeacher;
 
     @OneToMany(mappedBy = "schoolClass", fetch = FetchType.LAZY)
     @Builder.Default
     private List<Student> students = new ArrayList<>();
+
+    @OneToMany(mappedBy = "schoolClass", fetch = FetchType.LAZY)
+    @Builder.Default
+    private List<Section> sections = new ArrayList<>();
 }

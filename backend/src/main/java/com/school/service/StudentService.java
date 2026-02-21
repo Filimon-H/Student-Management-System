@@ -2,9 +2,11 @@ package com.school.service;
 
 import com.school.dto.StudentDTO;
 import com.school.entity.SchoolClass;
+import com.school.entity.Section;
 import com.school.entity.Student;
 import com.school.exception.ResourceNotFoundException;
 import com.school.repository.SchoolClassRepository;
+import com.school.repository.SectionRepository;
 import com.school.repository.StudentRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -19,6 +21,7 @@ public class StudentService {
 
     private final StudentRepository studentRepository;
     private final SchoolClassRepository schoolClassRepository;
+    private final SectionRepository sectionRepository;
 
     public List<StudentDTO> getAllStudents() {
         return studentRepository.findAll().stream()
@@ -67,6 +70,12 @@ public class StudentService {
             student.setSchoolClass(schoolClass);
         }
 
+        if (dto.getSectionId() != null) {
+            Section section = sectionRepository.findById(dto.getSectionId())
+                    .orElseThrow(() -> new ResourceNotFoundException("Section not found with id: " + dto.getSectionId()));
+            student.setSection(section);
+        }
+
         return toDTO(studentRepository.save(student));
     }
 
@@ -89,6 +98,14 @@ public class StudentService {
             student.setSchoolClass(schoolClass);
         } else {
             student.setSchoolClass(null);
+        }
+
+        if (dto.getSectionId() != null) {
+            Section section = sectionRepository.findById(dto.getSectionId())
+                    .orElseThrow(() -> new ResourceNotFoundException("Section not found with id: " + dto.getSectionId()));
+            student.setSection(section);
+        } else {
+            student.setSection(null);
         }
 
         return toDTO(studentRepository.save(student));
@@ -118,6 +135,8 @@ public class StudentService {
                 .guardianPhone(student.getGuardianPhone())
                 .classId(student.getSchoolClass() != null ? student.getSchoolClass().getId() : null)
                 .className(student.getSchoolClass() != null ? student.getSchoolClass().getName() : null)
+                .sectionId(student.getSection() != null ? student.getSection().getId() : null)
+                .sectionName(student.getSection() != null ? student.getSection().getName() : null)
                 .build();
     }
 }

@@ -20,8 +20,12 @@ public class SchoolClassDTO {
 
     private String grade;
     private String section;
+    private Long classTypeId;
+    private String classTypeName;
     private Long homeroomTeacherId;
     private String homeroomTeacherName;
     private int studentCount;
+    private int sectionCount;
     private List<StudentDTO> students;
+    private List<SectionDTO> sections;
 }
