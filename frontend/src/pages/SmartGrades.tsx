@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Plus, Trash2, FileText, ChevronDown, ChevronRight, AlertCircle, Award, BookOpen } from 'lucide-react';
 import { assessmentApi, termApi, classApi, subjectApi, studentApi } from '../api/services';
-import { Assessment, GradeEntry, ReportCard, Term, SchoolClass, Subject, Student, AssessmentType } from '../types';
+import { Assessment, GradeEntry, ReportCard, Term, SchoolClass, Subject, Student, AssessmentType, SubjectMark } from '../types';
 import { useAuth } from '../context/AuthContext';
 
 const LETTER_COLORS: Record<string, string> = {
@@ -9,6 +9,7 @@ const LETTER_COLORS: Record<string, string> = {
   B: 'bg-blue-100 text-blue-700',
   C: 'bg-yellow-100 text-yellow-700',
   D: 'bg-orange-100 text-orange-700',
+  E: 'bg-orange-50 text-orange-600',
   F: 'bg-red-100 text-red-700',
 };
 
@@ -16,7 +17,7 @@ const ASSESSMENT_TYPES: AssessmentType[] = ['QUIZ', 'ASSIGNMENT', 'MIDTERM', 'FI
 
 export default function SmartGrades() {
   const { user } = useAuth();
-  const canEdit = user?.role === 'ADMIN' || user?.role === 'TEACHER';
+  const canEdit = user?.role === 'SUPER_ADMIN' || user?.role === 'ADMIN' || user?.role === 'TEACHER';
 
   const [terms, setTerms] = useState<Term[]>([]);
   const [classes, setClasses] = useState<SchoolClass[]>([]);
@@ -394,42 +395,50 @@ export default function SmartGrades() {
             <div className="p-6 space-y-4">
               {reportCard.subjects.length === 0 ? (
                 <p className="text-center text-gray-400 py-8">No graded subjects for this term.</p>
-              ) : reportCard.subjects.map(sub => (
+              ) : reportCard.subjects.map((sub: SubjectMark) => (
                 <div key={sub.subjectId} className="border border-gray-100 rounded-xl overflow-hidden">
                   <div className="flex items-center justify-between px-4 py-3 bg-gray-50">
                     <div className="flex items-center gap-2">
                       <BookOpen size={14} className="text-blue-500" />
                       <span className="font-semibold text-gray-900">{sub.subjectName}</span>
-                      <span className="text-xs text-gray-400">{sub.credits} cr</span>
                     </div>
                     <div className="flex items-center gap-3">
-                      <span className="text-sm text-gray-600">{sub.finalPercentage}%</span>
-                      <span className={`text-sm font-bold px-2.5 py-0.5 rounded-full ${LETTER_COLORS[sub.letterGrade] || 'bg-gray-100 text-gray-600'}`}>
-                        {sub.letterGrade}
+                      <span className="text-sm text-gray-600">{sub.total}/100</span>
+                      <span className={`text-sm font-bold px-2.5 py-0.5 rounded-full ${LETTER_COLORS[sub.grade] || 'bg-gray-100 text-gray-600'}`}>
+                        {sub.grade}
                       </span>
-                      <span className="text-xs text-gray-400">{sub.gpaPoints.toFixed(1)} pts</span>
+                      <span className="text-xs text-gray-400">{sub.remarks}</span>
                     </div>
                   </div>
                   <table className="w-full text-xs">
                     <thead className="bg-white border-b border-gray-100">
                       <tr>
-                        <th className="text-left px-4 py-2 text-gray-400 font-medium">Assessment</th>
-                        <th className="text-left px-4 py-2 text-gray-400 font-medium">Type</th>
+                        <th className="text-left px-4 py-2 text-gray-400 font-medium">Component</th>
                         <th className="text-right px-4 py-2 text-gray-400 font-medium">Score</th>
-                        <th className="text-right px-4 py-2 text-gray-400 font-medium">%</th>
-                        <th className="text-right px-4 py-2 text-gray-400 font-medium">Weight</th>
+                        <th className="text-right px-4 py-2 text-gray-400 font-medium">Max</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-50">
-                      {sub.assessments.map((a, i) => (
-                        <tr key={i} className="hover:bg-gray-50">
-                          <td className="px-4 py-2 text-gray-700">{a.assessmentName}</td>
-                          <td className="px-4 py-2 text-gray-500">{a.assessmentType}</td>
-                          <td className="px-4 py-2 text-right text-gray-700">{a.score}/{a.maxScore}</td>
-                          <td className="px-4 py-2 text-right text-gray-700">{a.percentage}%</td>
-                          <td className="px-4 py-2 text-right text-gray-500">{a.weight}%</td>
-                        </tr>
-                      ))}
+                      <tr className="hover:bg-gray-50">
+                        <td className="px-4 py-2 text-gray-700">CA1</td>
+                        <td className="px-4 py-2 text-right text-gray-700">{sub.ca1}</td>
+                        <td className="px-4 py-2 text-right text-gray-500">{sub.ca1Max}</td>
+                      </tr>
+                      <tr className="hover:bg-gray-50">
+                        <td className="px-4 py-2 text-gray-700">CA2</td>
+                        <td className="px-4 py-2 text-right text-gray-700">{sub.ca2}</td>
+                        <td className="px-4 py-2 text-right text-gray-500">{sub.ca2Max}</td>
+                      </tr>
+                      <tr className="hover:bg-gray-50">
+                        <td className="px-4 py-2 text-gray-700">Exam</td>
+                        <td className="px-4 py-2 text-right text-gray-700">{sub.exam}</td>
+                        <td className="px-4 py-2 text-right text-gray-500">{sub.examMax}</td>
+                      </tr>
+                      <tr className="hover:bg-gray-50 font-semibold">
+                        <td className="px-4 py-2 text-gray-900">Total</td>
+                        <td className="px-4 py-2 text-right text-gray-900">{sub.total}</td>
+                        <td className="px-4 py-2 text-right text-gray-500">100</td>
+                      </tr>
                     </tbody>
                   </table>
                 </div>

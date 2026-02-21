@@ -13,7 +13,7 @@ export default function Classes() {
   const [editing, setEditing] = useState<SchoolClass | null>(null);
   const [form, setForm] = useState({ name: '', grade: '', section: '', homeroomTeacherId: '' });
 
-  const isAdmin = user?.role === 'ADMIN';
+  const isAdmin = user?.role === 'SUPER_ADMIN' || user?.role === 'ADMIN';
 
   const fetchClasses = () => {
     setLoading(true);

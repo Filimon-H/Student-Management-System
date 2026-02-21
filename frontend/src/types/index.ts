@@ -2,7 +2,7 @@ export interface User {
   email: string;
   firstName: string;
   lastName: string;
-  role: 'ADMIN' | 'TEACHER' | 'STUDENT';
+  role: 'SUPER_ADMIN' | 'ADMIN' | 'TEACHER' | 'STUDENT' | 'PARENT' | 'ACCOUNTANT' | 'LIBRARIAN';
   token: string;
   studentId?: number;
   teacherId?: number;
@@ -13,7 +13,7 @@ export interface AuthResponse {
   email: string;
   firstName: string;
   lastName: string;
-  role: 'ADMIN' | 'TEACHER' | 'STUDENT';
+  role: 'SUPER_ADMIN' | 'ADMIN' | 'TEACHER' | 'STUDENT' | 'PARENT' | 'ACCOUNTANT' | 'LIBRARIAN';
   studentId?: number;
   teacherId?: number;
 }
@@ -29,6 +29,25 @@ export interface Student {
   guardianPhone?: string;
   classId?: number;
   className?: string;
+  sectionId?: number;
+  sectionName?: string;
+}
+
+export interface ClassType {
+  id: number;
+  name: string;
+  code: string;
+}
+
+export interface Section {
+  id: number;
+  name: string;
+  classId: number;
+  className?: string;
+  teacherId?: number;
+  teacherName?: string;
+  active: boolean;
+  studentCount: number;
 }
 
 export interface Teacher {
@@ -47,10 +66,14 @@ export interface SchoolClass {
   name: string;
   grade?: string;
   section?: string;
+  classTypeId?: number;
+  classTypeName?: string;
   homeroomTeacherId?: number;
   homeroomTeacherName?: string;
   studentCount: number;
+  sectionCount: number;
   students?: Student[];
+  sections?: Section[];
 }
 
 export interface Subject {
@@ -126,23 +149,21 @@ export interface GradeEntry {
   remarks?: string;
 }
 
-export interface AssessmentScore {
-  assessmentName: string;
-  assessmentType: string;
-  score: number;
-  maxScore: number;
-  percentage: number;
-  weight: number;
-}
-
-export interface SubjectReport {
+export interface SubjectMark {
   subjectId: number;
   subjectName: string;
-  credits: number;
-  finalPercentage: number;
-  letterGrade: string;
-  gpaPoints: number;
-  assessments: AssessmentScore[];
+  ca1: number;
+  ca1Max: number;
+  ca2: number;
+  ca2Max: number;
+  caTotal: number;
+  caTotalMax: number;
+  exam: number;
+  examMax: number;
+  total: number;
+  grade: string;
+  subjectPosition: number;
+  remarks: string;
 }
 
 export interface ReportCard {
@@ -151,9 +172,17 @@ export interface ReportCard {
   termName: string;
   academicYear: string;
   className: string;
-  gpa: number;
+  sectionName: string;
+  classTypeName: string;
+  termNumber: number;
+  totalScoresObtained: number;
+  finalAverage: number;
+  classAverage: number;
+  position: number;
+  totalStudentsInClass: number;
   overallGrade: string;
-  subjects: SubjectReport[];
+  gpa: number;
+  subjects: SubjectMark[];
 }
 
 export interface AttendanceSummary {

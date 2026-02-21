@@ -13,7 +13,7 @@ export default function Teachers() {
   const [editing, setEditing] = useState<Teacher | null>(null);
   const [form, setForm] = useState({ firstName: '', lastName: '', email: '', phone: '', specialization: '', subjectIds: [] as number[] });
 
-  const isAdmin = user?.role === 'ADMIN';
+  const isAdmin = user?.role === 'SUPER_ADMIN' || user?.role === 'ADMIN';
 
   const fetchTeachers = () => {
     setLoading(true);

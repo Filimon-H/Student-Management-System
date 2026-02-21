@@ -15,7 +15,7 @@ export default function Grades() {
   const [showModal, setShowModal] = useState(false);
   const [form, setForm] = useState({ studentId: '', subjectId: '', score: '', maxScore: '100', examName: '', examDate: '', remarks: '' });
 
-  const canEdit = user?.role === 'ADMIN' || user?.role === 'TEACHER';
+  const canEdit = user?.role === 'SUPER_ADMIN' || user?.role === 'ADMIN' || user?.role === 'TEACHER';
   const isStudent = user?.role === 'STUDENT';
 
   useEffect(() => {

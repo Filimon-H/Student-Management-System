@@ -13,7 +13,7 @@ export default function Attendance() {
   const [loading, setLoading] = useState(false);
   const [bulkStatus, setBulkStatus] = useState<Record<number, string>>({});
 
-  const canMark = user?.role === 'ADMIN' || user?.role === 'TEACHER';
+  const canMark = user?.role === 'SUPER_ADMIN' || user?.role === 'ADMIN' || user?.role === 'TEACHER';
 
   useEffect(() => {
     classApi.getAll().then((res) => setClasses(res.data));

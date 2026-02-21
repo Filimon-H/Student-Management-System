@@ -14,7 +14,7 @@ export default function Students() {
   const [editing, setEditing] = useState<Student | null>(null);
   const [form, setForm] = useState({ firstName: '', lastName: '', email: '', dateOfBirth: '', address: '', guardianName: '', guardianPhone: '', classId: '' });
 
-  const isAdmin = user?.role === 'ADMIN';
+  const isAdmin = user?.role === 'SUPER_ADMIN' || user?.role === 'ADMIN';
 
   const fetchStudents = () => {
     setLoading(true);

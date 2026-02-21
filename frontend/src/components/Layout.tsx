@@ -20,18 +20,20 @@ import {
 } from 'lucide-react';
 
 const navItems = [
-  { label: 'Dashboard', path: '/dashboard', icon: LayoutDashboard, roles: ['ADMIN', 'TEACHER', 'STUDENT'] },
+  { label: 'Dashboard', path: '/dashboard', icon: LayoutDashboard, roles: ['SUPER_ADMIN', 'ADMIN', 'TEACHER', 'STUDENT', 'PARENT', 'ACCOUNTANT'] },
   { label: 'My Profile', path: '/my-profile', icon: UserCircle, roles: ['STUDENT'] },
-  { label: 'Students', path: '/students', icon: Users, roles: ['ADMIN', 'TEACHER'] },
-  { label: 'Teachers', path: '/teachers', icon: GraduationCap, roles: ['ADMIN'] },
-  { label: 'Classes', path: '/classes', icon: School, roles: ['ADMIN', 'TEACHER'] },
-  { label: 'Subjects', path: '/subjects', icon: BookOpen, roles: ['ADMIN'] },
-  { label: 'Terms', path: '/terms', icon: Calendar, roles: ['ADMIN', 'TEACHER'] },
-  { label: 'Enrollments', path: '/enrollments', icon: UserCheck, roles: ['ADMIN'] },
-  { label: 'Assignments', path: '/assignments', icon: ClipboardList, roles: ['ADMIN'] },
-  { label: 'Attendance', path: '/attendance', icon: ClipboardCheck, roles: ['ADMIN', 'TEACHER', 'STUDENT'] },
-  { label: 'Grades', path: '/grades', icon: FileBarChart, roles: ['ADMIN', 'TEACHER', 'STUDENT'] },
-  { label: 'Smart Grades', path: '/smart-grades', icon: Award, roles: ['ADMIN', 'TEACHER'] },
+  { label: 'Students', path: '/students', icon: Users, roles: ['SUPER_ADMIN', 'ADMIN', 'TEACHER'] },
+  { label: 'Teachers', path: '/teachers', icon: GraduationCap, roles: ['SUPER_ADMIN', 'ADMIN'] },
+  { label: 'Classes', path: '/classes', icon: School, roles: ['SUPER_ADMIN', 'ADMIN', 'TEACHER'] },
+  { label: 'Sections', path: '/sections', icon: School, roles: ['SUPER_ADMIN', 'ADMIN'] },
+  { label: 'Subjects', path: '/subjects', icon: BookOpen, roles: ['SUPER_ADMIN', 'ADMIN'] },
+  { label: 'Terms', path: '/terms', icon: Calendar, roles: ['SUPER_ADMIN', 'ADMIN', 'TEACHER'] },
+  { label: 'Enrollments', path: '/enrollments', icon: UserCheck, roles: ['SUPER_ADMIN', 'ADMIN'] },
+  { label: 'Assignments', path: '/assignments', icon: ClipboardList, roles: ['SUPER_ADMIN', 'ADMIN'] },
+  { label: 'Attendance', path: '/attendance', icon: ClipboardCheck, roles: ['SUPER_ADMIN', 'ADMIN', 'TEACHER', 'STUDENT'] },
+  { label: 'Grades', path: '/grades', icon: FileBarChart, roles: ['SUPER_ADMIN', 'ADMIN', 'TEACHER', 'STUDENT'] },
+  { label: 'Smart Grades', path: '/smart-grades', icon: Award, roles: ['SUPER_ADMIN', 'ADMIN', 'TEACHER'] },
+  { label: 'Marksheet', path: '/marksheet', icon: FileBarChart, roles: ['SUPER_ADMIN', 'ADMIN', 'TEACHER', 'STUDENT'] },
 ];
 
 export default function Layout() {
@@ -42,9 +44,13 @@ export default function Layout() {
   const filteredNav = navItems.filter((item) => user && item.roles.includes(user.role));
 
   const roleLabel: Record<string, string> = {
-    ADMIN: 'Super Admin',
+    SUPER_ADMIN: 'Super Admin',
+    ADMIN: 'Admin',
     TEACHER: 'Teacher',
     STUDENT: 'Student',
+    PARENT: 'Parent',
+    ACCOUNTANT: 'Accountant',
+    LIBRARIAN: 'Librarian',
   };
 
   const SidebarContent = () => (

@@ -22,7 +22,7 @@ type ViewMode = 'daily' | 'monthly';
 
 export default function AttendancePage() {
   const { user } = useAuth();
-  const canEdit = user?.role === 'ADMIN' || user?.role === 'TEACHER';
+  const canEdit = user?.role === 'SUPER_ADMIN' || user?.role === 'ADMIN' || user?.role === 'TEACHER';
   const isStudent = user?.role === 'STUDENT';
 
   // Student-only state

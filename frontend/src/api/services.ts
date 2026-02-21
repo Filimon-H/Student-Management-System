@@ -1,5 +1,5 @@
 import api from './axios';
-import { AuthResponse, Student, Teacher, SchoolClass, Subject, Attendance, Grade, DashboardStats, Term, Enrollment, TeacherAssignment, Assessment, GradeEntry, ReportCard, AttendanceSummary } from '../types';
+import { AuthResponse, Student, Teacher, SchoolClass, Subject, Attendance, Grade, DashboardStats, Term, Enrollment, TeacherAssignment, Assessment, GradeEntry, ReportCard, AttendanceSummary, ClassType, Section } from '../types';
 
 // Auth
 export const authApi = {
@@ -42,6 +42,26 @@ export const classApi = {
   create: (data: Partial<SchoolClass>) => api.post<SchoolClass>('/classes', data),
   update: (id: number, data: Partial<SchoolClass>) => api.put<SchoolClass>(`/classes/${id}`, data),
   delete: (id: number) => api.delete(`/classes/${id}`),
+};
+
+// Class Types
+export const classTypeApi = {
+  getAll: () => api.get<ClassType[]>('/class-types'),
+  getById: (id: number) => api.get<ClassType>(`/class-types/${id}`),
+  create: (data: Partial<ClassType>) => api.post<ClassType>('/class-types', data),
+  update: (id: number, data: Partial<ClassType>) => api.put<ClassType>(`/class-types/${id}`, data),
+  delete: (id: number) => api.delete(`/class-types/${id}`),
+};
+
+// Sections
+export const sectionApi = {
+  getAll: () => api.get<Section[]>('/sections'),
+  getByClass: (classId: number) => api.get<Section[]>(`/sections/class/${classId}`),
+  getActiveByClass: (classId: number) => api.get<Section[]>(`/sections/class/${classId}/active`),
+  getById: (id: number) => api.get<Section>(`/sections/${id}`),
+  create: (data: Partial<Section>) => api.post<Section>('/sections', data),
+  update: (id: number, data: Partial<Section>) => api.put<Section>(`/sections/${id}`, data),
+  delete: (id: number) => api.delete(`/sections/${id}`),
 };
 
 // Subjects

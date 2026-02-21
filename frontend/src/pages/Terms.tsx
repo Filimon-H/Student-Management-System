@@ -6,7 +6,7 @@ import { useAuth } from '../context/AuthContext';
 
 export default function Terms() {
   const { user } = useAuth();
-  const isAdmin = user?.role === 'ADMIN';
+  const isAdmin = user?.role === 'SUPER_ADMIN' || user?.role === 'ADMIN';
 
   const [terms, setTerms] = useState<Term[]>([]);
   const [loading, setLoading] = useState(true);

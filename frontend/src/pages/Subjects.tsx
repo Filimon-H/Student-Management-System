@@ -12,7 +12,7 @@ export default function Subjects() {
   const [editing, setEditing] = useState<Subject | null>(null);
   const [form, setForm] = useState({ name: '', code: '', description: '' });
 
-  const isAdmin = user?.role === 'ADMIN';
+  const isAdmin = user?.role === 'SUPER_ADMIN' || user?.role === 'ADMIN';
 
   const fetchSubjects = () => {
     setLoading(true);
