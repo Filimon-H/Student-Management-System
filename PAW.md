@@ -3364,3 +3364,298 @@ open http://localhost:8983/solr
 | Check what's on a port | `lsof -i :8080` |
 | Get an OAuth token | `curl -X POST http://localhost:8081/oauth/token ...` |
 | Create a member via API | `curl -X POST http://localhost:8080/programs/DEMO/members ...` |
+
+---
+
+## 18) Drools Rules Engine — The Heart of Loyalty Recognition
+
+### 18.1) What is Drools?
+
+**Drools** is an open-source **business rules engine** (BRE) developed by Red Hat. Think of it as a specialized decision-making system where you write "if-then" rules in a declarative language, and the engine evaluates those rules against incoming data to produce outcomes.
+
+**Simple analogy:**
+```
+Traditional code:
+if (transaction.amount > 100 && member.tier == "GOLD") {
+    awardPoints(transaction.amount * 2);
+}
+
+Drools rule (.drl file):
+rule "Gold members get 2x points on purchases over £100"
+when
+    $txn : Transaction(amount > 100)
+    $member : Member(tier == "GOLD")
+then
+    awardPoints($txn.amount * 2);
+end
+```
+
+The difference: In traditional code, the logic is buried in Java classes. In Drools, the rules are **separate text files** (`.drl` files) that business analysts can read and modify without touching Java code.
+
+---
+
+### 18.2) Why ALP-E Uses Drools (Not Hard-Coded Java Logic)
+
+In a loyalty platform, the **earning rules change constantly**:
+- "This month: 3x points on groceries"
+- "VIP members: bonus 500 points on first purchase"
+- "Spend £50 at Partner X, get a free coffee voucher"
+
+If these rules were hard-coded in Java, **every rule change would require**:
+1. A developer to change the code
+2. Recompile the application
+3. Redeploy to production
+4. Risk introducing bugs
+
+With Drools, **business users can change rules** through the Configuration Web UI, and the new rules take effect immediately (or after a scheduled reload) — **no code deployment needed**.
+
+---
+
+### 18.3) How Drools Fits Into the ALP-E Architecture
+
+From the Architecture Manual (lines 467-481):
+
+> **Rules Engine (RE) is the heart of the ALP-E**, where member interactions are recognized and rewarded with points. The Rules engine is a sub-component of the Endeavour Engine, and Endeavour utilizes **Apache Camel** as a routing engine to send interactions to the Rules Engine and receives back a list of actions as outcomes.
+
+> **Drools Rules implement the MU rules**, with necessary data access to fetch and perform the required evaluation to award loyalty currency. All REST APIs that handle incoming interactions to handle loyalty recognition calculation (points' calculation), in synchronous manner.
+
+**The flow:**
+```
+1. Member makes a purchase → POS system posts interaction
+                                    ↓
+2. Endeavour Application receives POST /programs/ACME/members/{id}/generic-interaction
+                                    ↓
+3. InteractionMediator saves interaction to MySQL
+                                    ↓
+4. Interaction event posted to ActiveMQ
+                                    ↓
+5. Apache Camel route picks up the event
+                                    ↓
+6. Camel invokes Drools Rules Engine with:
+   - The interaction (purchase amount, partner, date)
+   - The member (tier, status, segments)
+   - All active Marketing Units (MUs) for this programme
+                                    ↓
+7. Drools evaluates each MU rule:
+   - MU "Grocery 3x": Does this interaction match? (partner == GROCER)
+   - MU "VIP Bonus": Is member in VIP segment?
+   - MU "Spend £50 Promo": Has member spent £50 this month?
+                                    ↓
+8. Drools returns a list of "Follow-On Actions":
+   - Award 300 points (100 base + 200 bonus)
+   - Send "Thank you" email
+   - Increment "purchases this month" counter
+                                    ↓
+9. Action Handlers execute each action:
+   - Create EARN transaction (300 points)
+   - Fire TRANSACTION event → Event Hub, Gateway, Search
+   - Fire COMMUNICATION event → Email service
+```
+
+---
+
+### 18.4) What is a Marketing Unit (MU)?
+
+A **Marketing Unit (MU)** is ALP-E's term for a **promotion or earning rule**. Each MU is implemented as one or more Drools rules.
+
+**Examples of MUs:**
+| MU Name | What it does | Drools rule logic |
+|---|---|---|
+| Base Earn | Award 1 point per £1 spent | `when Transaction(amount > 0) then award(amount * 1)` |
+| Grocery 3x | Triple points at grocery partners | `when Transaction(partner.category == "GROCERY") then award(amount * 3)` |
+| Birthday Bonus | 500 bonus points on your birthday | `when Member(today == dateOfBirth.dayOfYear) then award(500)` |
+| Tiered Earn | Gold = 2x, Platinum = 3x | `when Member(tier == "GOLD") then multiplier = 2` |
+| Spend & Get | Spend £100, get a £10 voucher | `when accumulate(Transactions over 30 days; sum(amount) > 100) then issue(voucher)` |
+
+Each MU has:
+- **Configuration** (stored in MySQL `endeavour_rules` schema): start date, end date, priority, eligibility segments
+- **Rule logic** (Drools `.drl` files): the actual if-then conditions
+- **Salience** (priority): if multiple MUs match, which fires first?
+
+---
+
+### 18.5) Where Drools Lives in the Codebase
+
+Based on the architecture and the module structure:
+
+**The Rules Engine is NOT in the `endeavour-application` repo you have locally.** It's a **separate service** (likely in a separate Git repo or a module you don't have yet). The official docs mention:
+
+> "The Rules Engine is a sub-component of the Endeavour Engine"
+
+This means it's either:
+1. A separate Maven module (e.g., `endeavour-re-rules/` or `endeavour-rules-engine/`) that you'd find in the full enterprise repo
+2. A separate microservice that runs alongside Endeavour Application
+
+**What you DO have in your local repo:**
+- **Apache Camel routes** in `endeavour-application` that dispatch interactions to the Rules Engine
+- **MU configuration APIs** in `endeavour-application` (REST endpoints for Configuration Web to create/update MUs)
+- **Action handlers** in `endeavour-application` that process the outcomes returned by Drools
+
+**What you DON'T have locally (but exists in production):**
+- The actual `.drl` rule files (Drools rule definitions)
+- The Drools KieSession setup (the Java code that loads and executes rules)
+- The MU instance executor (the component that runs each MU against an interaction)
+
+---
+
+### 18.6) How Configuration Web Manages MUs
+
+From the Architecture Manual (line 412):
+> "Manage Programme level MU configuration and interaction types"
+
+**The workflow for creating a new promotion:**
+
+```
+1. Business user logs into Configuration Web
+2. Navigate to "Marketing Units" → "Create New MU"
+3. Fill in the form:
+   - Name: "Summer Sale 5x Points"
+   - Start Date: 2024-06-01
+   - End Date: 2024-08-31
+   - Interaction Type: PURCHASE
+   - Partner: FASHION_RETAILER
+   - Segments: ALL_MEMBERS
+   - Rule Template: "Multiplier Earn"
+   - Multiplier: 5
+4. Configuration Web calls: POST /programs/ACME/marketing-units
+5. Endeavour Application saves the MU config to MySQL (endeavour_rules schema)
+6. Rules Engine picks up the new MU (either immediately or on next reload)
+7. From June 1st, any purchase at FASHION_RETAILER triggers this MU → 5x points
+```
+
+**Behind the scenes:** The "Rule Template" is a pre-written Drools rule with placeholders. When you create the MU, the system fills in the placeholders (partner code, multiplier value) and generates the final `.drl` file.
+
+---
+
+### 18.7) Drools Rule File Example (What a .drl Looks Like)
+
+This is what an actual Drools rule file might look like for a simple MU:
+
+```drools
+package com.ga.endeavour.rules.earn;
+
+import com.ga.endeavour.recognition.domain.Interaction;
+import com.ga.endeavour.member.domain.Member;
+import com.ga.endeavour.rules.domain.MuInstance;
+import com.ga.endeavour.rules.domain.FollowOnAction;
+
+global java.util.List actions;
+
+rule "Grocery 3x Points - MU Instance 12345"
+    salience 100
+    when
+        $mu : MuInstance(muId == 12345, active == true)
+        $interaction : Interaction(
+            interactionType == "PURCHASE",
+            partner.category == "GROCERY",
+            amount > 0
+        )
+        $member : Member(
+            status.code == "ACTIVE",
+            segments contains "STANDARD"
+        )
+    then
+        int basePoints = $interaction.getAmount();
+        int bonusPoints = basePoints * 2;  // 3x total = base + 2x bonus
+        
+        FollowOnAction earnAction = new FollowOnAction();
+        earnAction.setActionType("AWARD_POINTS");
+        earnAction.setCurrencyCode("POINTS");
+        earnAction.setAmount(basePoints + bonusPoints);
+        earnAction.setDescription("Grocery 3x promotion");
+        earnAction.setMuInstanceId($mu.getMuId());
+        
+        actions.add(earnAction);
+        
+        System.out.println("MU 12345 fired: awarded " + (basePoints + bonusPoints) + " points");
+end
+```
+
+**What this rule says in plain English:**
+- **When:** An active MU (ID 12345) exists, AND a member makes a purchase at a grocery partner, AND the member is active and in the STANDARD segment
+- **Then:** Calculate 3x points (base + 2x bonus) and add an "AWARD_POINTS" action to the actions list
+
+---
+
+### 18.8) How Drools Executes (The KieSession Lifecycle)
+
+```java
+// Simplified version of what happens inside the Rules Engine
+
+// 1. Load all active MU rules for this programme
+KieServices kieServices = KieServices.Factory.get();
+KieContainer kieContainer = kieServices.getKieClasspathContainer();
+KieSession kieSession = kieContainer.newKieSession("endeavour-rules-session");
+
+// 2. Insert facts (data) into the session
+kieSession.insert(interaction);  // The purchase event
+kieSession.insert(member);       // The member who made the purchase
+kieSession.insert(muInstance1);  // MU "Grocery 3x"
+kieSession.insert(muInstance2);  // MU "VIP Bonus"
+kieSession.insert(muInstance3);  // MU "Base Earn"
+
+// 3. Set up the global actions list
+List<FollowOnAction> actions = new ArrayList<>();
+kieSession.setGlobal("actions", actions);
+
+// 4. Fire all rules (Drools evaluates every rule against the facts)
+int rulesFired = kieSession.fireAllRules();
+System.out.println("Fired " + rulesFired + " rules");
+
+// 5. Dispose the session
+kieSession.dispose();
+
+// 6. Return the actions list to Endeavour Application
+return actions;  // e.g., [AWARD_POINTS: 300, SEND_EMAIL: "thank_you.html"]
+```
+
+---
+
+### 18.9) Why This Matters for PAW
+
+If you're building PAW (the hierarchy extension), you have **two options** for how PAW outcomes integrate with the rules engine:
+
+**Option 1: PAW bypasses Drools entirely**
+- PAW calculates hierarchy bonuses (e.g., "Bob gets 5% of Sarah's earn")
+- PAW posts the outcome directly as an interaction: `POST /programs/ACME/members/{bob-id}/generic-interaction`
+- This interaction has `interactionType = "PAW_HIERARCHY_OUTCOME"`
+- A simple Drools rule (or no rule at all) just awards the points as-is
+
+**Option 2: PAW outcomes trigger Drools rules**
+- PAW posts the same interaction
+- But you create MUs that **react to** `PAW_HIERARCHY_OUTCOME` interactions
+- Example MU: "If hierarchy outcome > 1000 points, also send a 'Top Performer' badge"
+- This lets you layer additional logic on top of PAW's calculations
+
+**Recommended:** Option 1 (bypass). PAW has already done the complex graph traversal. Drools would just be a pass-through. Keep it simple.
+
+---
+
+### 18.10) Key Drools Concepts Summary
+
+| Concept | What it is | Example |
+|---|---|---|
+| **Rule** | An if-then statement | `when Member(tier == "GOLD") then award(bonus)` |
+| **Fact** | Data inserted into the session | `Interaction`, `Member`, `MuInstance` |
+| **KieSession** | The runtime environment where rules execute | Created per interaction, disposed after |
+| **Salience** | Rule priority (higher = fires first) | MU with salience 100 fires before salience 50 |
+| **Global** | A variable shared across all rules | `global List actions` — all rules add to this list |
+| **Follow-On Action** | The output of a rule | `AWARD_POINTS`, `SEND_EMAIL`, `UPDATE_TIER` |
+| **MU Instance** | A configured promotion | "Summer Sale 5x Points" (MU ID 12345) |
+| **.drl file** | Drools rule language file | `grocery-3x-promo.drl` |
+
+---
+
+### 18.11) Where to Learn More About Drools
+
+- **Official Drools docs:** https://docs.drools.org/
+- **ALP-E docs you have:** `ALP-E R18 Architecture Manual.txt` (lines 467-481)
+- **In the codebase (when you get the full repo):** Look for:
+  - `endeavour-re-rules/` or `endeavour-rules-engine/` module
+  - Files ending in `.drl`
+  - Classes with `KieSession`, `KieContainer`, `KieServices`
+  - The Apache Camel route that dispatches to the Rules Engine (probably in `endeavour-application-mediator` or a Camel-specific module)
+
+---
+
+> **Bottom line:** Drools is the "brain" that decides "should this member get points for this action?" It's separate from the core Endeavour Application, but tightly integrated via Apache Camel. Every interaction flows through Drools, which evaluates all active MUs and returns a list of actions (award points, send email, etc.). This design lets business users change earning rules without touching code.
