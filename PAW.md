@@ -2881,3 +2881,486 @@ PAW is a **new, separate Spring Boot service** — not a module inside `endeavou
 | **Jetty** | Web server | Embedded in Maven locally / Tomcat in production | Hosts the WAR file, handles HTTP requests |
 | **Endeavour App** | Java WAR | `mvn jetty:run` locally / Tomcat container in production | The core loyalty engine — REST APIs, business logic, event raising |
 | **PAW Service** | Java JAR (Spring Boot) | `mvn spring-boot:run` locally / Docker container in production | Hierarchy calculation sidecar — talks to ALP-E via REST |
+
+---
+
+## 17) Command Reference — Every Command You Will Use on This Project
+
+> Every command listed here is something you will realistically type while working on this project. Each one is explained in plain English — what it does, when you use it, and what to expect.
+
+---
+
+### 17.1) Docker Commands
+
+Docker runs the four infrastructure services (MySQL, MongoDB, ActiveMQ, Solr) as isolated containers on your Mac.
+
+---
+
+#### Starting and stopping the environment
+
+```bash
+# Start all four services in the background (-d = detached, runs without blocking your terminal)
+docker compose up -d
+```
+> Run this from `infrastructure/dev-env-setup/`. After this command you have MySQL, MongoDB, ActiveMQ, and Solr running and ready. The Java app can now start.
+
+```bash
+# Stop all containers but keep their data (volumes preserved)
+docker compose stop
+```
+> Use this when you're done for the day. All data you created (members, programmes, etc.) is still there when you start again.
+
+```bash
+# Stop AND delete all containers AND their data (full wipe)
+docker compose down
+docker compose down -v
+```
+> `down` removes containers but keeps volumes (data). `down -v` removes everything including all MySQL tables and MongoDB collections. Use `-v` when you want a clean slate — after this you need to re-run `populate_mysql.sh`.
+
+```bash
+# Start again after stopping
+docker compose up -d
+```
+
+---
+
+#### Checking what's running
+
+```bash
+# List all running containers and their status
+docker ps
+```
+> Shows you each container's name, status (Up/Exited), and which ports it's listening on. You should see `mysql8`, `mongo`, `activemq`, `solr` all showing `Up`.
+
+```bash
+# List ALL containers including stopped ones
+docker ps -a
+```
+
+```bash
+# See live logs from a specific container
+docker logs mysql8 -f
+docker logs activemq -f
+docker logs mongo -f
+docker logs solr -f
+```
+> `-f` means "follow" — keeps streaming new log lines. Press `Ctrl+C` to stop. Use this to debug why a container isn't starting.
+
+```bash
+# See the last 50 lines of logs (without following)
+docker logs mysql8 --tail 50
+```
+
+---
+
+#### Getting inside a container
+
+```bash
+# Open a shell inside the MySQL container
+docker exec -it mysql8 bash
+
+# Then inside the container, open the MySQL client
+mysql -u root -p
+# Password: (whatever was set in docker-compose.yml, usually 'root' or 'endeavour')
+```
+> Use this to inspect the database directly — run SQL queries, check tables, verify data.
+
+```bash
+# Or connect to MySQL in one command without going inside the container
+docker exec -it mysql8 mysql -u root -p
+```
+
+```bash
+# Open a shell inside the MongoDB container
+docker exec -it mongo bash
+# Then start the mongo shell
+mongosh
+```
+
+---
+
+#### Rebuilding a container image
+
+```bash
+# Rebuild a specific service's image (if you changed its Dockerfile)
+docker compose build mysql8
+
+# Rebuild all services
+docker compose build
+```
+
+---
+
+### 17.2) Maven Commands
+
+Maven is the build tool. It compiles Java code, runs tests, and packages the application into a deployable file (WAR or JAR). All Maven commands start with `mvn`.
+
+---
+
+#### Building
+
+```bash
+# Compile all Java source files — just checks for syntax errors, no tests
+mvn compile
+```
+> Fastest check. If this fails, you have a compile error (wrong syntax, missing import, etc.).
+
+```bash
+# Compile + run all unit tests
+mvn test
+```
+> Unit tests are fast (milliseconds each) and don't need Docker. If a test fails, Maven tells you which class and which assertion failed.
+
+```bash
+# Compile + test + package into a WAR/JAR file (skipping tests for speed)
+mvn package -DskipTests
+```
+> Creates the deployable artifact in the `target/` folder. `-DskipTests` makes it faster by skipping test execution (compilation still happens).
+
+```bash
+# Compile + test + package + install into local Maven cache (~/.m2)
+mvn install -DskipTests
+```
+> This is the one you run most often. `install` puts the built artifact in your local `~/.m2/repository` cache so other modules in the same project can depend on it. **Always run `install` before `jetty:run`.**
+
+```bash
+# Full build: compile + test + integration tests + package + install
+mvn verify
+```
+> The "full" build that CI/CD runs. Slower because it includes integration tests (which need Docker running).
+
+```bash
+# Build only a specific module and everything it depends on
+mvn install -pl endeavour-application-mediator -am -DskipTests
+```
+> `-pl` = project list (which module). `-am` = also make (build its dependencies first). Use this when you only changed one module and don't want to rebuild everything.
+
+```bash
+# Build everything from the parent, skipping all tests
+mvn install -DskipTests
+```
+> Run from `infrastructure/endeavour-application/` to build all modules in the right order.
+
+---
+
+#### Running the application
+
+```bash
+# Start the application server (Jetty embedded web server) on port 8080
+mvn jetty:run
+```
+> Run from the `endeavour-application-app/` directory (the deployable module). This starts the web server and keeps it running. You'll see `[INFO] Started Jetty Server` when it's ready. Press `Ctrl+C` to stop.
+
+```bash
+# Start with a specific port (if 8080 is taken)
+mvn jetty:run -Djetty.port=9090
+```
+
+```bash
+# Start Spring Boot application (for PAW or any Spring Boot module)
+mvn spring-boot:run
+```
+> For Spring Boot projects. Starts the embedded Tomcat server. Uses `application.properties` or `application.yml` for configuration.
+
+```bash
+# Start Spring Boot with a specific profile (e.g., local vs production config)
+mvn spring-boot:run -Dspring-boot.run.profiles=local
+```
+
+---
+
+#### Cleaning up
+
+```bash
+# Delete all compiled output (the target/ folder in every module)
+mvn clean
+```
+> Run this when you get weird errors after switching branches — stale compiled `.class` files can cause confusing problems.
+
+```bash
+# Clean then build (most common combo when something is broken)
+mvn clean install -DskipTests
+```
+
+---
+
+#### Dependency inspection
+
+```bash
+# Show the full dependency tree for a module
+mvn dependency:tree
+```
+> Useful when you get a "class not found" error — shows you which JAR provides which class, and whether there are conflicting versions.
+
+```bash
+# Show which dependencies are outdated
+mvn versions:display-dependency-updates
+```
+
+```bash
+# Download all dependencies without building (useful first step on a fresh clone)
+mvn dependency:resolve
+```
+
+---
+
+#### Running a specific test
+
+```bash
+# Run only one test class
+mvn test -Dtest=MemberMediatorTest
+
+# Run only one test method inside a class
+mvn test -Dtest=MemberMediatorTest#shouldCreateMember
+```
+
+---
+
+### 17.3) Git Commands
+
+You'll use these to manage your code changes and collaborate with the team.
+
+```bash
+# See what files you've changed
+git status
+
+# See the actual diff of your changes
+git diff
+
+# Stage all changes for commit
+git add .
+
+# Stage a specific file
+git add src/main/java/com/ga/endeavour/app/mediator/member/MemberMediator.java
+
+# Commit your staged changes with a message
+git commit -m "ALP-1234: Add PAW hierarchy outcome interaction type"
+
+# Push your branch to the remote server
+git push origin feature/paw-integration
+
+# Pull the latest changes from the team
+git pull
+
+# Create a new branch for your feature
+git checkout -b feature/paw-integration
+
+# Switch back to main branch
+git checkout main
+
+# See all branches
+git branch -a
+
+# See recent commit history (last 10 commits, one line each)
+git log --oneline -10
+
+# See who last changed each line in a file
+git blame src/main/java/.../MemberMediator.java
+```
+
+---
+
+### 17.4) MySQL Commands (for inspecting the database)
+
+Run these after connecting via `docker exec -it mysql8 mysql -u root -p`.
+
+```sql
+-- List all schemas (databases)
+SHOW DATABASES;
+
+-- Switch to the member schema
+USE endeavour_ods;
+
+-- List all tables in the current schema
+SHOW TABLES;
+
+-- See the structure of the member table
+DESCRIBE me_member;
+
+-- Find a specific member
+SELECT member_id, first_name, last_name, status_code, enrolment_date
+FROM me_member
+WHERE program_code = 'DEMO'
+LIMIT 10;
+
+-- Check that a token exists
+SELECT * FROM me_member_tokens WHERE primary_token_value = '4000000000001234';
+
+-- Check member accounts (point balances)
+SELECT * FROM me_member_account WHERE program_code = 'DEMO';
+
+-- See all configured programmes
+USE endeavour_program;
+SELECT program_code, name, status FROM pr_program;
+
+-- See all OAuth2 clients (who can call the API)
+USE endeavour_identity;
+SELECT client_id, scope FROM id_oauth_client;
+
+-- See the Liquibase migration history (what schema versions have been applied)
+USE endeavour_ods;
+SELECT * FROM DATABASECHANGELOG ORDER BY dateexecuted DESC LIMIT 20;
+```
+
+---
+
+### 17.5) cURL Commands (Testing the REST API Manually)
+
+Use these to test API endpoints without needing a UI. Run from any terminal.
+
+```bash
+# Step 1: Get an OAuth2 access token (client credentials flow)
+curl -X POST http://localhost:8081/oauth/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials&client_id=endeavour-client&client_secret=secret"
+# Response: {"access_token":"abc123...","expires_in":3600,"token_type":"bearer"}
+
+# Save the token to a variable for reuse
+TOKEN="abc123..."
+
+# Step 2: Create a new member
+curl -X POST http://localhost:8080/programs/DEMO/members \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "firstName": "Sarah",
+    "lastName": "Jones",
+    "gender": "FEMALE",
+    "language": "en_GB",
+    "tokens": [{"type": "LOYALTY_CARD", "primaryTokenValue": "4000000000001234"}],
+    "addresses": [{"addressChannelName": "EMAIL", "value": "sarah@example.com"}]
+  }'
+# Response: 201 Created, Location: /programs/DEMO/members/123456
+
+# Step 3: Retrieve a member
+curl -X GET http://localhost:8080/programs/DEMO/members/123456 \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: application/json"
+
+# Step 4: Post an interaction (earn points)
+curl -X POST http://localhost:8080/programs/DEMO/members/123456/generic-interaction \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "PURCHASE",
+    "value": 5000,
+    "currencyCode": "GBP",
+    "source": "POS"
+  }'
+
+# Step 5: Check application health
+curl http://localhost:8080/health
+```
+
+---
+
+### 17.6) Liquibase Commands (Database Schema Management)
+
+Liquibase tracks and applies database schema changes. ALP-E uses it to version-control all SQL.
+
+```bash
+# Apply all pending migrations (run from the module that owns the schema)
+mvn liquibase:update
+
+# Roll back the last migration
+mvn liquibase:rollback -Dliquibase.rollbackCount=1
+
+# See which migrations have been applied vs pending
+mvn liquibase:status
+
+# Generate a SQL file of what would be applied (without actually running it)
+mvn liquibase:updateSQL
+```
+> You typically don't run these manually — `populate_mysql.sh` runs them for you. But if you add a new table to your feature, you create a new Liquibase changeset XML file and then run `mvn liquibase:update` to apply it.
+
+---
+
+### 17.7) Application Logs (Finding What Went Wrong)
+
+When something breaks, these commands help you find the error.
+
+```bash
+# Follow the live application log (Jetty is running in another terminal)
+# The log file is usually in the target/ or logs/ directory
+tail -f target/logs/endeavour.log
+
+# Search the log for ERROR lines
+grep "ERROR" target/logs/endeavour.log
+
+# Search for a specific member ID in the logs
+grep "123456" target/logs/endeavour.log
+
+# Search for a specific exception
+grep "ValidationErrorException" target/logs/endeavour.log | tail -20
+
+# See all logs from a specific class
+grep "MemberMediator" target/logs/endeavour.log | tail -30
+```
+
+When `mvn jetty:run` is running in the foreground, the logs print directly to your terminal — no need for `tail`.
+
+---
+
+### 17.8) Useful One-Liners and Combos
+
+```bash
+# The "start everything and run the app" combo (do this every morning)
+cd ~/aimia/infrastructure/dev-env-setup && docker compose up -d && \
+cd ../endeavour-application && mvn install -DskipTests && \
+cd endeavour-application-app && mvn jetty:run
+
+# Full clean rebuild (use when something is inexplicably broken)
+mvn clean install -DskipTests
+
+# Check if the app is actually running
+curl -s http://localhost:8080/health | python3 -m json.tool
+
+# Check which port is being used (if you get "port already in use")
+lsof -i :8080
+lsof -i :8081
+
+# Kill whatever is running on port 8080
+kill -9 $(lsof -ti:8080)
+
+# Check Docker is using too much memory/CPU
+docker stats
+
+# Remove ALL stopped containers and unused images (free up disk space)
+docker system prune
+
+# See how much disk Docker is using
+docker system df
+
+# Restart a single Docker container without stopping others
+docker compose restart mysql8
+
+# Connect to ActiveMQ admin UI in browser
+open http://localhost:8161
+# Default credentials: admin / admin
+# Here you can see message queues, pending messages, dead-letter queues
+
+# Connect to Solr admin UI in browser
+open http://localhost:8983/solr
+# Here you can run test queries against the search index
+```
+
+---
+
+### 17.9) Quick Command Cheat Sheet
+
+| Situation | Command |
+|---|---|
+| Start the dev environment | `docker compose up -d` (from `dev-env-setup/`) |
+| Stop the dev environment | `docker compose stop` |
+| Wipe everything and start fresh | `docker compose down -v` then re-run `populate_mysql.sh` |
+| Build everything | `mvn clean install -DskipTests` |
+| Run the application | `mvn jetty:run` (from `endeavour-application-app/`) |
+| Run only one test class | `mvn test -Dtest=MyTestClass` |
+| Check if app is running | `curl http://localhost:8080/health` |
+| See running containers | `docker ps` |
+| See container logs | `docker logs <name> -f` |
+| Connect to MySQL | `docker exec -it mysql8 mysql -u root -p` |
+| Clean a broken build | `mvn clean` |
+| Check what's on a port | `lsof -i :8080` |
+| Get an OAuth token | `curl -X POST http://localhost:8081/oauth/token ...` |
+| Create a member via API | `curl -X POST http://localhost:8080/programs/DEMO/members ...` |
