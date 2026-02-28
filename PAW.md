@@ -2011,3 +2011,873 @@ Now that you understand the official ALP-E architecture, here's how PAW fits in:
 | **Configuration Web** | PAW would need its own admin UI or extend Config Web | Spring Boot + React recommended for PAW admin |
 
 > **Key insight from the docs:** ALP-E was **designed** for extension via the Gateway SPI and event-driven architecture. PAW as a sidecar fits naturally into this design — it's essentially a new "Provider" that handles hierarchy, just like the Facebook or PayPal adaptors handle social login and payments.
+
+---
+
+## 14) Trace Cookbook — Following Real Requests Through the Code
+
+> **Why this matters:** Reading architecture diagrams is one thing. Actually knowing "which Java file handles this HTTP request, what gets called next, and where does the data end up" is what lets you debug, modify, and extend the system.
+
+### 14.1) DEEP WALKTHROUGH: Member Enrolment (Create a New Loyalty Member)
+
+This is the **most common operation** in any loyalty programme — a new customer signs up. We'll follow the request from the moment it hits the server until the member exists in the database and events are flying through the system.
+
+#### The Business Story
+
+> **Scenario:** A customer named "Sarah Jones" visits the ACME loyalty programme website and fills out an enrolment form with her name, email, and a loyalty card number. The website sends this data to ALP-E. ALP-E must:
+> 1. Validate the data (is the programme active? is the card number unique? is the email format valid?)
+> 2. Create a new member record in MySQL
+> 3. Generate a member account (for tracking point balances)
+> 4. Fire events (so the Event Hub stores it in MongoDB, the Search Service re-indexes for Call Centre search, and the Gateway can notify external systems)
+> 5. Return a `201 Created` with the new member's URL
+
+#### Step-by-Step Code Trace
+
+```
+HTTP Request:
+POST /programs/ACME/members
+Authorization: Bearer <OAuth2 token>
+Content-Type: application/json
+
+{
+  "salutation": "Ms",
+  "firstName": "Sarah",
+  "lastName": "Jones",
+  "gender": "FEMALE",
+  "dateOfBirth": "1990-05-15",
+  "language": "en_GB",
+  "tokens": [
+    {
+      "type": "LOYALTY_CARD",
+      "primaryTokenValue": "4000000000001234"
+    }
+  ],
+  "addresses": [
+    {
+      "addressChannelName": "EMAIL",
+      "value": "sarah.jones@example.com"
+    }
+  ]
+}
+```
+
+---
+
+#### STEP 1: HTTP Layer — `MemberResource.addNew()`
+
+**File:** `endeavour-application/endeavour-application-resource/src/main/java/com/ga/endeavour/app/resource/member/MemberResource.java`
+
+```java
+@POST
+@Consumes({APPLICATION_JSON, APPLICATION_ENDEAVOUR_VERSION1_JSON})
+@Produces({APPLICATION_JSON, APPLICATION_ENDEAVOUR_VERSION1_JSON})
+@PreAuthorize(PROGRAM_AND_VIEW_EDIT_MEMBER_AND_MAINTAIN_MEMBER_CLIENT_AUTHORITY
+              + " or " + TPA_TO_MANAGE_BASIC_PROFILE)
+public Response addNew(@PathParam(PROGRAM_CODE) ProgramCode programCode,
+                       MemberRequest memberRequest,
+                       @Context UriInfo uriInfo,
+                       @QueryParam("sharingCode") String sharingCode) {
+    memberRequest.setProgramCode(programCode.getValue());
+    Member member = memberMediator.create(memberRequest, sharingCode);
+    return Response.created(memberUriBuilder(uriInfo, member.getMemberId())).build();
+}
+```
+
+**What happens here:**
+1. **JAX-RS (RESTEasy)** deserializes the JSON body into a `MemberRequest` object.
+2. **`@PreAuthorize`** checks: Does the caller's OAuth2 token have `MAINTAIN_MEMBER` + `VIEW_EDIT_BASIC_PROFILE_INFO` permissions? Or is it a trusted TPA with `RESOURCE_MEMBER_PROFILE_MANAGE` scope? If not → **403 Forbidden**.
+3. Sets the programme code from the URL path onto the request object.
+4. Delegates to `memberMediator.create()` — this is where the real work begins.
+5. Returns **201 Created** with a `Location` header pointing to the new member's URL (e.g., `/programs/ACME/members/123456`).
+
+**Key classes at this layer:**
+- `MemberRequest` — DTO containing all the member fields (name, tokens, addresses, etc.)
+- `ProgramCode` — Tiny type wrapper around a String (type safety)
+- `MemberResource` is annotated `@Path("/programs/{programCode}/members")` — this is the URL pattern
+
+---
+
+#### STEP 2: Mediator Layer — `MemberMediator.create()`
+
+**File:** `endeavour-application/endeavour-application-mediator/src/main/java/com/ga/endeavour/app/mediator/member/MemberMediator.java`
+
+```java
+@Override
+@CacheSafeMethod
+@Transactional(isolation = Isolation.READ_COMMITTED, propagation = Propagation.REQUIRED)
+public Member create(MemberRequest memberRequest, String sharingCode) {
+    // 1. Validate programme exists and is active
+    programExistsAndActiveValidator.validateWithException(memberRequest.getProgramCode());
+
+    // 2. Validate enrolment date + timezone
+    memberRequestEnrolmentDateValidator.validateWithException(...);
+
+    // 3. Validate location ID
+    locationIdValidator.validateWithException(memberRequest.getLocationId());
+
+    // 4. Check token uniqueness (is this loyalty card already used?)
+    validateForUniqueTokenValue(memberRequest.getProgramCode(), memberRequest.getTokens());
+
+    // 5. Load programme reference data (token types, statuses, countries, etc.)
+    MemberContext memberContext = getMemberContext(memberRequest);
+
+    // 6. Handle sharing/referral code if present
+    if (StringUtils.isNotEmpty(sharingCode)) { ... validate and attach referrer ... }
+
+    // 7. Load encryption config for sensitive tokens
+    Map<String, ProviderConfigurationPayload> providerConfigurationMap =
+        loadConfigurationForEncryptionTypes(memberRequest, ...);
+
+    // 8. *** CORE: Create the member in the database ***
+    MemberActionResult memberActionResult = memberService.create(memberContext, providerConfigurationMap);
+
+    // 9. Create a point-balance account for the new member
+    accountService.createAccount(memberRequest.getProgramCode(), memberId, false);
+
+    // 10. Save profile answers (golden questions like "favourite colour")
+    saveProfileAnswers(memberActionResults);
+
+    // 11. Flush to DB (make sure member ID is generated)
+    entityManager.flush();
+
+    // 12. *** EVENTS: Fire member enrolment events ***
+    memberEventRaiser.raiseEvents(memberActionResult);
+
+    // 13. Fire status change event
+    statusChangeEventRaiser.raiseEventFromMemberRequest(memberRequest);
+
+    // 14. If referral, fire sharing events
+    if (sharingCode != null) {
+        eventBusNotifier.post(new EndeavourEvent(EventFamily.SHARING, ...));
+    }
+
+    return createdMember;
+}
+```
+
+**What happens here (the business logic centre):**
+
+| Step | What | Why |
+|---|---|---|
+| 1-4 | **Validation** | Fail fast — don't create garbage data. Programme must exist, card must be unique |
+| 5 | **Load MemberContext** | MemberContext is a cached object containing ALL programme reference data (valid genders, token types, address channels, member statuses, countries). This avoids repeated DB queries |
+| 6 | **Referral handling** | "Member Get Member" feature — Sarah was referred by an existing member |
+| 7 | **Encryption config** | Some tokens (e.g., credit card numbers) need AES-256 encryption before storage |
+| 8 | **Database persistence** | Calls `MemberServiceImpl.create()` which validates, assembles, and persists the `Member` entity |
+| 9 | **Account creation** | Creates a row in the `me_member_account` table with zero balances for all currencies |
+| 10 | **Profile answers** | Stores answers to "golden questions" configured for the programme |
+| 11 | **Flush** | Forces Hibernate to execute the INSERT statements so the member ID is available |
+| 12-14 | **Event raising** | Fires MEMBER ENROL event, ADDRESS NEW event, MEMBER_TOKEN ADD_TOKEN event, STATUS_CHANGE event, and optionally SHARING events |
+
+---
+
+#### STEP 3: Service Layer — `MemberServiceImpl.create()` → `createInternal()`
+
+**File:** `endeavour-application/endeavour-member-repository/src/main/java/com/ga/endeavour/member/service/impl/MemberServiceImpl.java`
+
+```java
+@Override
+@DashboardReportable
+public MemberActionResult create(MemberContext memberContext, ...) {
+    // Find pre-generated tokens (if batch-issued cards)
+    List<GeneratedToken> generatedTokens = tokenGenerationService.findGeneratedTokens(...);
+    // Delegate to createInternal
+    MemberActionResult result = createInternal(memberContext, true, providerConfigurationMap);
+    return result;
+}
+
+MemberActionResult createInternal(MemberContext memberContext, ...) {
+    // 1. Create empty Member entity
+    Member member = new Member();
+    memberContext.member(member);
+
+    // 2. Validate tokens against password rules
+    validateRequestTokensWithPasswordRules(memberRequest, memberRequestTokenTypes);
+
+    // 3. Encrypt sensitive token values (AES-256)
+    maybeEncryptRequestTokens(memberRequest, ...);
+
+    // 4. Run full creation validation strategy
+    validationStrategy.validateCreate(memberContext).failIfErrors();
+
+    // 5. Validate member states
+    validationStrategy.validateMemberState(...).failIfErrors();
+
+    // 6. *** ASSEMBLE: Map request DTO → domain entity ***
+    member = assembleMemberAndSetProgramDefaults(memberContext);
+    //   - Sets default status (e.g., "ACTIVE")
+    //   - Sets default language (e.g., "en_GB")
+
+    // 7. Generate loyalty tokens (auto-number if needed)
+    memberTokenGenerationStrategy.generateAndUpdateMemberTokens(memberContext);
+
+    // 8. Final token validation (uniqueness, format, mandatory checks)
+    validateTokens(memberContext, member);
+
+    // 9. *** PERSIST: Save to MySQL via Hibernate ***
+    memberRepository.add(member);
+
+    // 10. Record status history + state history
+    updateStatusHistory(member, null);
+    updateStateHistory(member, ...);
+
+    // 11. Mark as new (for event raising logic)
+    member.setNew(true);
+
+    return new MemberActionResult(member, memberRequest, MemberActionType.Create, ...);
+}
+```
+
+**What happens at the validation layer:**
+
+The `MemberCreateValidationStrategy` (in `endeavour-member-repository/.../validation/strategy/`) runs:
+- Bean validation annotations on `MemberRequest` (JSR-303: `@NotNull`, `@Size`, etc.)
+- Gender validation against programme's configured genders
+- Address validation (country exists? address template matches?)
+- Status validation (must be an "initial" status like ACTIVE)
+
+---
+
+#### STEP 4: Repository Layer — `HibernateMemberRepository.add()`
+
+**File:** `endeavour-application/endeavour-member-repository/src/main/java/com/ga/endeavour/member/repository/jpa/HibernateMemberRepository.java`
+
+```java
+@Override
+public String add(Member member) {
+    member.setCdcCreatedTimestamp(new LocalDateTime(this.clock.now()));
+    currentSession().saveOrUpdate(member);
+    this.auditRepository.log(member, MemberAuditType.CREATED, AuditRecord.SYSTEM_USER);
+    return member.getMemberId();
+}
+```
+
+**What happens:**
+1. Sets a CDC (Change Data Capture) timestamp — used by Tungsten Replicator to detect changes.
+2. **`currentSession().saveOrUpdate(member)`** — Hibernate writes the `Member` entity (and cascaded child entities like `MemberToken`, `Address`) to MySQL tables:
+   - `me_member` — the member record
+   - `me_member_tokens` — loyalty card numbers
+   - `me_member_address` — email, physical address, etc.
+3. **Audit log** — writes to `me_member_audit` table recording who created the member and when.
+
+**MySQL tables affected:**
+
+| Table | What gets inserted |
+|---|---|
+| `me_member` | memberId, programCode, firstName, lastName, gender, DOB, language, status, enrolmentDate |
+| `me_member_tokens` | tokenType, primaryValue (card number), secondaryValue (hashed password), claimStatus |
+| `me_member_address` | channelType (EMAIL), value (sarah.jones@example.com), country |
+| `me_member_audit` | memberId, action (CREATED), user (SYSTEM), timestamp |
+| `me_member_account` | memberId, programCode, accountId (from step 9 in Mediator) |
+| `me_member_status_history` | memberId, statusCode (ACTIVE), fromDate |
+
+---
+
+#### STEP 5: Event Raising — `MemberEventRaiser.raiseEvents()`
+
+**File:** `endeavour-application/endeavour-application-mediator/src/main/java/com/ga/endeavour/app/mediator/member/MemberEventRaiser.java`
+
+```java
+public void raiseEvents(@Nonnull MemberActionResult memberActionResult) {
+    // 1. Map action type to event type: Create → ENROL
+    EventType eventType = toEventType(memberActionResult.getMemberActionType(), ...);
+    //    MemberActionType.Create → MemberEventTypes.ENROL
+
+    // 2. Build MemberEventDetails (the event payload)
+    MemberEventDetails details = toEventDetails(eventType, member);
+    //    Contains: memberId, programCode, name, tokens, addresses, status, etc.
+
+    // 3. Post MEMBER ENROL event to EventBus
+    EndeavourEvent memberEvent = new EndeavourEvent(EventFamily.MEMBER, eventType, details);
+    eventBus.post(memberEvent);
+
+    // 4. Post ADDRESS NEW events (one per address)
+    List<EndeavourEvent> addressEvents = buildAddressEvents(member);
+    eventBus.post(addressEvents);
+
+    // 5. Post MEMBER_TOKEN ADD_TOKEN events (one per token)
+    List<EndeavourEvent> tokenEvents = buildEventForMemberRequestTokens(memberActionResult);
+    eventBus.post(tokenEvents);
+}
+```
+
+---
+
+#### STEP 6: Event Transport — `EventBusNotifier` → ActiveMQ
+
+**File:** `endeavour-platform/endeavour-platform-event/src/main/java/com/ga/endeavour/platform/event/service/EventBusNotifier.java`
+
+```java
+public void post(EndeavourEvent event) {
+    if (deferringEvents(deferredEventHolder.get())) {
+        // Async mode: collect events, send AFTER transaction commits
+        postAsynchronous(event);
+    } else {
+        // Sync mode: send immediately to the event bus
+        eventBus.post(event);
+    }
+}
+```
+
+**What happens:**
+1. The `EventBusNotifier` is a Spring `TransactionListener`. For member creation, events are deferred until the DB transaction commits (so events are never sent for rolled-back members).
+2. After commit, a new thread (`AsyncEventProcessing`) opens a new transaction and calls `eventBus.post(events)`.
+3. The `SimpleEventBus` is backed by **Spring's `ApplicationEventMulticaster`** which dispatches to registered listeners.
+4. One of those listeners is a **JMS template** that publishes the event JSON to an **ActiveMQ Virtual Topic**.
+
+**The Virtual Topic pattern:**
+```
+Topic:     VirtualTopic.endeavour.events
+           ↓                    ↓                    ↓
+Queue: Consumer.eventhub.*   Consumer.gateway.*   Consumer.search.*
+       (Event Hub Service)   (Gateway Service)    (Search Service)
+```
+
+Each consumer gets its own queue, so they process at their own pace. If Gateway is slow, it doesn't block Event Hub.
+
+---
+
+#### STEP 7: What Happens After — The Downstream Effects
+
+Once the events are on ActiveMQ, three things happen in parallel:
+
+**A) Event Hub (MongoDB storage)**
+- Receives the `MEMBER ENROL` event
+- Stores the full JSON payload in MongoDB collection `events.MEMBER_EVENT`
+- This becomes the permanent event history (for reporting, auditing, data extraction)
+
+**B) Gateway Service (external notifications)**
+- If a Communication adaptor is configured (e.g., Elastic Email), the Gateway fires a "Welcome Email" to Sarah
+- If an Event Push adaptor is configured, the event JSON is forwarded to the client's external system
+- The Data Mart adaptor may aggregate member count metrics
+
+**C) Search Service (Solr re-indexing)**
+- Receives the event
+- Indexes Sarah's name, email, card number into Solr
+- Now Call Centre agents can search "Sarah Jones" and find her instantly
+
+---
+
+#### The Complete Flow Diagram
+
+```
+                    Sarah fills out form on ACME website
+                                    │
+                                    ▼
+              POST /programs/ACME/members (JSON body)
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────┐
+│ MemberResource.addNew()                        [RESOURCE]   │
+│   ├── @PreAuthorize → OAuth2 permission check               │
+│   └── memberMediator.create(memberRequest)                  │
+│                        │                                     │
+│                        ▼                                     │
+│ MemberMediator.create()                        [MEDIATOR]   │
+│   ├── programExistsAndActiveValidator.validate()             │
+│   ├── validateForUniqueTokenValue()                          │
+│   ├── getMemberContext()  ← loads programme reference data   │
+│   ├── memberService.create()                                 │
+│   │       │                                                  │
+│   │       ▼                                                  │
+│   │   MemberServiceImpl.createInternal()       [SERVICE]    │
+│   │       ├── validateCreate() → bean validation + rules     │
+│   │       ├── assembleMemberAndSetProgramDefaults()          │
+│   │       ├── generateAndUpdateMemberTokens()                │
+│   │       ├── memberRepository.add(member)                   │
+│   │       │       │                                          │
+│   │       │       ▼                                          │
+│   │       │   HibernateMemberRepository.add()  [REPOSITORY] │
+│   │       │       ├── session.saveOrUpdate(member)           │
+│   │       │       │       → INSERT INTO me_member            │
+│   │       │       │       → INSERT INTO me_member_tokens     │
+│   │       │       │       → INSERT INTO me_member_address    │
+│   │       │       └── auditRepository.log(CREATED)           │
+│   │       │               → INSERT INTO me_member_audit      │
+│   │       └── updateStatusHistory()                          │
+│   │               → INSERT INTO me_member_status_history     │
+│   │                                                          │
+│   ├── accountService.createAccount()                         │
+│   │       → INSERT INTO me_member_account                    │
+│   │                                                          │
+│   ├── entityManager.flush()  ← all INSERTs execute now      │
+│   │                                                          │
+│   ├── memberEventRaiser.raiseEvents()          [EVENTS]     │
+│   │       ├── EventBusNotifier.post(MEMBER ENROL event)      │
+│   │       ├── EventBusNotifier.post(ADDRESS NEW events)      │
+│   │       └── EventBusNotifier.post(MEMBER_TOKEN events)     │
+│   │                                                          │
+│   └── statusChangeEventRaiser.raiseEvent()                   │
+│           └── EventBusNotifier.post(STATUS_CHANGE event)     │
+│                        │                                     │
+└────────────────────────┼─────────────────────────────────────┘
+                         │ (after TX commits)
+                         ▼
+              ActiveMQ Virtual Topic
+              ┌──────────┼──────────┐
+              ▼          ▼          ▼
+         Event Hub    Gateway    Search
+         (MongoDB)   (Email,    (Solr
+          stores     external    re-index)
+          event)     notify)
+```
+
+---
+
+#### File Reference Table (Every File Touched)
+
+| Layer | File | Purpose |
+|---|---|---|
+| **Resource** | `endeavour-application-resource/.../member/MemberResource.java` | HTTP endpoint, security, delegates to mediator |
+| **Request DTO** | `endeavour-application-resource/.../member/request/MemberRequest.java` | JSON → Java object mapping |
+| **Mediator** | `endeavour-application-mediator/.../member/MemberMediator.java` | Orchestration: validate → create → account → events |
+| **Context** | `endeavour-member-repository/.../service/MemberContext.java` | Cached programme reference data container |
+| **Service** | `endeavour-member-repository/.../service/impl/MemberServiceImpl.java` | Business rules: validation strategy, token generation, assembly |
+| **Validation** | `endeavour-member-repository/.../validation/strategy/MemberCreateValidationStrategy.java` | Bean validation + address + status checks |
+| **Assembler** | `endeavour-member-repository/.../service/impl/MemberAssembler.java` | Maps `MemberRequest` DTO → `Member` domain entity |
+| **Domain** | `endeavour-member-repository/.../domain/Member.java` | Hibernate entity (maps to `me_member` table) |
+| **Repository** | `endeavour-member-repository/.../repository/jpa/HibernateMemberRepository.java` | Hibernate `session.saveOrUpdate()` |
+| **Event Raiser** | `endeavour-application-mediator/.../member/MemberEventRaiser.java` | Builds events, posts to EventBus |
+| **Event Details** | `endeavour-application-mediator/.../event/EventDetailsFactory.java` | Creates `MemberEventDetails` payload from `Member` entity |
+| **Event Bus** | `endeavour-platform-event/.../service/EventBusNotifier.java` | Transaction-aware event posting (sync or deferred async) |
+| **Event Payload** | `endeavour-platform-event/.../payload/details/MemberEventDetails.java` | The JSON structure of the MEMBER event |
+| **Result** | `endeavour-member-repository/.../domain/MemberActionResult.java` | Wraps Member + original request + action type (Create/Update) |
+
+---
+
+### 14.2) Quick Trace: Post Interaction → Rules Engine → Points Awarded
+
+> **Scenario:** A POS system sends a transaction: "Sarah spent £50 at Partner GROCER". ALP-E must evaluate all active Marketing Units and award points.
+
+| Step | Class | What happens |
+|---|---|---|
+| 1 | `GenericInteractionResource.createGenericInteraction()` | Receives `POST /programs/ACME/members/{id}/generic-interaction` |
+| 2 | `GenericInteractionEventAssembler.toInteractionEvent()` | Converts `ActionRequest` → `InteractionEvent` |
+| 3 | `GatewayInteractionMediator.process()` | Resolves member (by token or ID), loads segments, checks earn permissions |
+| 4 | `InteractionMediator.saveAndPublishInteraction()` | Persists the interaction in MySQL, then publishes to the event bus |
+| 5 | `InteractionEventMediator` (event listener) | Picks up INTERACTION event, dispatches to Rules Engine via Apache Camel |
+| 6 | **Rules Engine** (Drools, in `endeavour-re-rules/`) | Evaluates all active MU instances against the interaction. MU "Value 2x" fires → outcome: award 100 points |
+| 7 | Back in Mediator | Follow-on actions: create EARN transaction, fire TRANSACTION event, fire ACCUMULATION event |
+| 8 | `EventBusNotifier` → ActiveMQ | TRANSACTION event → Event Hub (MongoDB), Gateway (Data Mart), Search (re-index balance) |
+
+**Key files:**
+- `endeavour-application-resource/.../recognition/GenericInteractionResource.java` — entry point
+- `endeavour-application-mediator/.../interaction/GatewayInteractionMediator.java` — orchestration
+- `endeavour-application-mediator/.../interaction/InteractionMediator.java` — save + publish
+- `endeavour-application-mediator/.../interaction/InteractionEventMediator.java` — event-driven follow-on
+- `endeavour-re-rules/` — Drools rule files (the actual MU logic)
+
+---
+
+### 14.3) Quick Trace: Batch Member Enrolment (File Import)
+
+> **Scenario:** A partner sends a CSV file with 10,000 new members. ALP-E processes it in bulk.
+
+| Step | Where | What happens |
+|---|---|---|
+| 1 | sFTP / S3 | File `MEMBER_ENROLMENT_2024-01-15.csv` lands in S3 bucket |
+| 2 | Batch Controller | `endeavour-batch/` validates CSV against schema XML, stages each row as a MongoDB document |
+| 3 | Batch Controller | Posts 10,000 "job reference" messages to ActiveMQ batch queue |
+| 4 | Batch Worker (x4) | Each worker picks messages, reads staged data from MongoDB |
+| 5 | Batch Worker | For each record, calls `POST /programs/ACME/members/register` (same REST API as online!) |
+| 6 | Endeavour App | Same flow as Section 14.1 — validate → create → events. But events are batched for performance |
+| 7 | `MemberEventRaiser.raiseEvents(Iterable<MemberActionResult>)` | Collects ALL events into one composite list, posts once (ALP-21467 performance fix) |
+| 8 | Reject file | Any failed records generate a reject file with error details |
+
+**Key insight:** Batch doesn't bypass the core — it calls the same REST APIs. The only difference is:
+- Events are batched (not one-by-one) for performance
+- MongoDB is used for staging (isolation per job execution)
+- Multiple worker nodes process in parallel
+
+---
+
+## 15) PAW Integration Contract (Proposed)
+
+> **This section defines exactly how PAW would connect to the existing ALP-E system.** Based on the architecture analysis, **REST API integration** is recommended over direct ActiveMQ publishing, because:
+> - PAW gets the benefit of all existing validation, security, and audit logic
+> - No need to understand the internal event format
+> - Easier to test (just HTTP calls)
+> - Follows the same pattern as Batch Workers (external caller → REST → core logic → events)
+
+### 15.1) Integration Choice: REST API (via OAuth2)
+
+PAW authenticates to ALP-E exactly like any other Third-Party Application (TPA):
+
+```
+┌───────────┐         ┌──────────────┐         ┌──────────────────┐
+│    PAW    │──(1)──▶│   Identity   │         │    Endeavour     │
+│  Service  │◀──(2)──│   Service    │         │   Application    │
+│           │         │  (OAuth2)    │         │                  │
+│           │──(3)────────────────────────────▶│ POST /members    │
+│           │◀──(4)────────────────────────────│ POST /interaction│
+│           │──(5)────────────────────────────▶│ GET /balance     │
+└───────────┘         └──────────────┘         └──────────────────┘
+
+(1) POST /oauth/token {client_id, client_secret, grant_type=client_credentials}
+(2) Response: {access_token: "abc123", expires_in: 3600}
+(3-5) All subsequent calls include: Authorization: Bearer abc123
+```
+
+**PAW TPA Setup in Configuration Web:**
+- Client ID: `paw-service`
+- Client Secret: (generated)
+- Scopes: `RESOURCE_MEMBER_PROFILE_MANAGE`, `RESOURCE_INTERACTIONS_RAISE`, `RESOURCE_EXTERNAL_CALL_CENTRE_MANAGE`
+- User Role: `PAW_SERVICE_ROLE` with permissions: `MAINTAIN_MEMBER`, `VIEW_EDIT_BASIC_PROFILE_INFO`, `VIEW_INTR`
+
+### 15.2) Terminal Event JSON Schema
+
+When PAW computes a hierarchy result (e.g., "Sarah's manager Bob gets 5% of her points"), it sends a **Terminal Event** to ALP-E as an interaction:
+
+```json
+{
+  "correlationId": "paw-evt-20240115-000001",
+  "source": "PAW",
+  "interactionType": "PAW_HIERARCHY_OUTCOME",
+  "postedDate": "2024-01-15T14:30:00Z",
+  "memberId": "123456",
+  "programmeCode": "ACME",
+  "tokenTypeCode": "LOYALTY_CARD",
+  "primaryTokenValue": "4000000000001234",
+  "timeZoneOffsetMinutes": 0,
+  "capabilities": {
+    "value": {
+      "currencyCode": "POINTS",
+      "amount": 500,
+      "description": "Hierarchy bonus: 5% of downstream earn"
+    }
+  },
+  "metadata": {
+    "pawVersion": "1.0.0",
+    "graphSnapshotId": "snap-20240115-001",
+    "sourceNodeId": "node-sarah-123456",
+    "targetNodeId": "node-bob-789012",
+    "edgeType": "REPORTS_TO",
+    "calculationType": "PERCENTAGE_DOWNSTREAM_EARN",
+    "calculationValue": 0.05,
+    "originalEarnInteractionId": "98765"
+  }
+}
+```
+
+**Field definitions:**
+
+| Field | Required | Type | Purpose |
+|---|---|---|---|
+| `correlationId` | Yes | String | Unique ID for idempotency — if PAW retries, ALP-E can detect duplicates |
+| `source` | Yes | String | Always "PAW" — for audit trail |
+| `interactionType` | Yes | String | Must match a configured `ProgramInteractionType` in Config Web |
+| `memberId` | Yes | String | The ALP-E member ID of the person receiving the outcome |
+| `programmeCode` | Yes | String | The programme code |
+| `capabilities.value` | Yes | Object | The points/currency to award |
+| `metadata` | No | Object | PAW-specific data stored in the interaction payload for tracing |
+
+### 15.3) Idempotency & Error Handling
+
+| Concern | How PAW handles it |
+|---|---|
+| **Duplicate detection** | PAW includes `correlationId`. ALP-E's `InteractionMediator` detects duplicate interactions via `identityHash` and returns `409 Conflict` |
+| **Retries** | PAW retries failed calls with exponential backoff (1s, 2s, 4s, max 30s). After 5 retries → dead-letter queue in PAW's own DB |
+| **Partial failure** | If PAW computes outcomes for 100 members but call #47 fails, PAW marks #47 as "pending retry" and continues with #48-100 |
+| **ALP-E down** | PAW queues events locally (in its own MySQL/PostgreSQL) and drains the queue when ALP-E recovers |
+| **Stale graph** | PAW stamps every event with `graphSnapshotId`. If the graph was rebuilt since the event was computed, PAW can invalidate and recompute |
+
+### 15.4) Observability
+
+PAW should expose:
+- **Spring Boot Actuator** endpoints: `/actuator/health`, `/actuator/metrics`, `/actuator/info`
+- **Custom metrics**: `paw.events.sent`, `paw.events.failed`, `paw.graph.nodes.count`, `paw.graph.edges.count`
+- **Structured logging** with `correlationId` in every log line (so you can trace a single event from PAW through ALP-E's logs)
+- **Health check**: PAW's health endpoint should check:
+  - Own database connectivity
+  - ALP-E Identity Service reachability (can get OAuth token?)
+  - ALP-E Endeavour App reachability (can call `/programs/{code}/countries`?)
+
+### 15.5) Security Scopes Summary
+
+| PAW Operation | ALP-E Endpoint | Required Scope/Permission |
+|---|---|---|
+| Get OAuth token | `POST /oauth/token` | Client credentials (TPA client_id + secret) |
+| Send hierarchy outcome | `POST /programs/{code}/members/{id}/generic-interaction` | `RESOURCE_INTERACTIONS_RAISE` |
+| Look up member | `GET /programs/{code}/members/{id}` | `RESOURCE_MEMBER_PROFILE_VIEW` |
+| Look up member balance | `GET /programs/{code}/members/{id}/balance` | `RESOURCE_MEMBER_PROFILE_VIEW` |
+| Batch import org hierarchy | (PAW's own endpoint, not ALP-E) | PAW internal auth |
+
+---
+
+> **Bottom line:** PAW integrates with ALP-E the same way any external system does — via OAuth2 + REST. It just happens to run as a sidecar on the same infrastructure. The ALP-E docs explicitly support this pattern through the TPA mechanism and the Gateway adaptor framework.
+
+---
+
+## 16) Local Development Environment — What Everything Is and Why You Need It
+
+### 16.1) The Four Docker Services and Why Each One Exists
+
+When you run `docker compose up` inside `infrastructure/dev-env-setup/`, four containers start. Each one is a real external system that the application depends on. **Without them the Java app cannot start at all** — it will fail trying to connect to things that don't exist.
+
+---
+
+#### MySQL 8 (`mysql8`)
+
+**What it is:** A relational database — stores data in structured tables with rows and columns. The traditional kind of database you've heard of.
+
+**Why ALP-E uses it:** It is the **primary source of truth** for almost everything:
+- Member profiles (`me_member`, `me_member_tokens`, `me_member_address`)
+- Programme configuration (`pr_program`, `pr_token_type`, `pr_member_status`)
+- Interaction/transaction history (`re_interaction`)
+- Account balances (`me_member_account`)
+- Identity data — OAuth2 clients, users, scopes (`id_*` tables)
+
+There are **6 separate MySQL schemas** (logical databases inside the same MySQL server), each owned by a different module:
+| Schema | Owned by | What's in it |
+|---|---|---|
+| `endeavour_ods` | endeavour-application | Members, accounts, interactions |
+| `endeavour_program` | endeavour-application | Programmes, tokens, statuses |
+| `endeavour_identity` | endeavour-identity | OAuth2 clients, users, roles |
+| `endeavour_recognition` | endeavour-application | Interactions, transactions |
+| `endeavour_rules` | endeavour-re | Marketing Units, Drools rules |
+| `endeavour_batch` | endeavour-batch | Batch job history |
+
+**Why you need it locally:** Every single REST call reads from or writes to MySQL. No MySQL = the app throws `Connection refused` on startup and crashes.
+
+---
+
+#### MongoDB (`mongo`)
+
+**What it is:** A "document database" — instead of rows/columns, it stores JSON-like documents. Think of it as a giant collection of JSON files you can query.
+
+**Why ALP-E uses it for two completely separate purposes:**
+
+**Purpose 1 — Event Hub storage (permanent event history):**
+Every event (MEMBER ENROL, EARN TRANSACTION, STATUS CHANGE, etc.) is permanently stored as a JSON document in MongoDB. This is the "audit trail" and the source of data for reporting. When someone asks "show me all enrolments this month", the reporting service queries MongoDB — not MySQL. MySQL holds the current state; MongoDB holds the complete history of everything that ever happened.
+
+**Purpose 2 — Batch job staging:**
+When a 10,000-row CSV file comes in for batch processing, the Batch Controller reads the file and writes each row as a MongoDB document ("staging"). The Batch Workers then read from MongoDB rather than from the file. This isolates the batch job — if it crashes halfway through, the staged data is still there and the job can be retried.
+
+**Why you need it locally:** Without MongoDB, the Event Hub service won't start, and any batch job will fail immediately when it tries to write staging data.
+
+---
+
+#### ActiveMQ (`activemq`)
+
+**What it is:** A **message broker** — a middleman that lets one piece of software send a message to another piece of software without them needing to talk directly to each other. Like a post office: you drop a letter in, someone else picks it up later.
+
+**Why ALP-E uses it:** It is the **nervous system** of the whole platform. Almost nothing is done synchronously after the core transaction commits. Instead:
+1. The Endeavour Application posts events (MEMBER ENROL, EARN, STATUS CHANGE) to an ActiveMQ **Virtual Topic**.
+2. Each downstream service (Event Hub, Gateway, Search) has its own **queue** that receives a copy of every message.
+3. Each service processes at its own pace, independently.
+
+**Concrete example:**
+```
+MemberMediator.create() commits to MySQL
+         │
+         └──▶ EventBusNotifier.post(MEMBER ENROL event)
+                    │
+                    ▼
+              ActiveMQ Virtual Topic
+              ┌────────┬────────┬────────┐
+              ▼        ▼        ▼
+         Event Hub  Gateway   Search
+         (stores    (sends    (re-indexes
+          to Mongo)  email)    Solr)
+```
+
+This design means:
+- If Gateway is slow or down, members can still enrol (events queue up, Gateway catches up later)
+- If you want to add a new service that reacts to enrolments, you just subscribe a new queue — no code change in the core
+
+**Why you need it locally:** Without ActiveMQ, the `EventBusNotifier` fails to connect and throws JMS exceptions on startup. Any event-related functionality (which is almost everything) breaks.
+
+---
+
+#### Solr (`solr`)
+
+**What it is:** A **search engine** — a specialised database optimised for full-text searching. When you type "Sarah Jones" in the Call Centre UI and it finds the right member instantly, Solr is doing that work. MySQL is terrible at this kind of search; Solr is built for exactly it.
+
+**Why ALP-E uses it:** The Call Centre Search feature. When a member calls in, the agent searches by name, email, card number, or partial values. Solr has the member data indexed (pre-processed for fast searching). Every time a member is created or updated, a MEMBER event goes to the Search Service via ActiveMQ, and the Search Service tells Solr to re-index that member.
+
+**Why you need it locally:** Without Solr, the Search Service (`endeavour-search`) won't start. If you're working on anything that touches member search, or you run integration tests, they'll fail with a Solr connection error. Even if you're not working on search directly, the Search Service's health check failure can cause problems with the overall application startup.
+
+---
+
+### 16.2) What `populate_mysql.sh` Did — Explained Simply
+
+When you ran `populate_mysql.sh`, you **created all the database tables and loaded the minimum required reference data** so the application has something to work with. Without this, MySQL would be an empty server with no tables — the Java app would start, try to query a table that doesn't exist, and crash.
+
+Specifically, the script did these things in order:
+
+**Step 1 — Created the schemas (databases):**
+```sql
+CREATE DATABASE IF NOT EXISTS endeavour_ods;
+CREATE DATABASE IF NOT EXISTS endeavour_program;
+CREATE DATABASE IF NOT EXISTS endeavour_identity;
+-- ... etc
+```
+
+**Step 2 — Ran Liquibase migrations:**
+Each module has a set of SQL migration files (managed by Liquibase, a database versioning tool). The script ran all of them, which created every table in every schema:
+- `me_member`, `me_member_tokens`, `me_member_address`, `me_member_account` (member module)
+- `pr_program`, `pr_token_type`, `pr_member_status` (programme module)
+- `id_oauth_client`, `id_user`, `id_role` (identity module)
+- etc.
+
+**Step 3 — Loaded seed/reference data:**
+Inserted the minimum data rows the app needs to function:
+- A default **Programme** (`DEMO` or `TEST`) so there's at least one active programme
+- Default **OAuth2 clients** (the app itself, test clients) so authentication can work
+- Default **roles and permissions** so users have something to log in as
+- Default **token types** (e.g., `LOYALTY_CARD`) so member enrolment has a valid card type to reference
+- Default **member statuses** (e.g., `ACTIVE`, `SUSPENDED`) so the status validation logic has valid values to check against
+
+**In plain English:** Before `populate_mysql.sh`, MySQL was an empty box. After it, MySQL has the right shape (tables) and the minimum contents (seed data) for the Java application to start and do something useful.
+
+---
+
+### 16.3) Is the Local Environment Necessary to Build? What Can You Actually Do Locally?
+
+**Short answer:** You can **compile and package** the code without Docker running. But you **cannot run and test** the application without Docker.
+
+Here's the distinction:
+
+| Action | Docker needed? | Command |
+|---|---|---|
+| Compile all Java code | ❌ No | `mvn compile` |
+| Run unit tests | ❌ No | `mvn test` |
+| Build JAR/WAR packages | ❌ No | `mvn package` |
+| Run integration tests | ✅ Yes | `mvn verify` |
+| Start the running application | ✅ Yes | `mvn jetty:run` |
+| Test an API endpoint manually | ✅ Yes | `curl http://localhost:8080/...` |
+| Debug live code | ✅ Yes | IDE debug → running Jetty |
+
+**Why:** The Java code at compile time just becomes bytecode (`.class` files). It doesn't need a database to compile. But the moment you actually *run* the app, Spring tries to connect to MySQL, ActiveMQ, Solr, and MongoDB. If they're not there, it fails.
+
+---
+
+### 16.4) The Full Developer Workflow — How to Make a Change and Push It
+
+Here is the exact workflow from "I want to change something" to "it's deployed":
+
+#### Phase 1: Local Development (Your Mac)
+
+```
+1. Start Docker services:
+   cd infrastructure/dev-env-setup
+   docker compose up -d
+   (starts mysql8, mongo, activemq, solr)
+
+2. Build the module you're working on:
+   cd infrastructure/endeavour-application
+   mvn install -DskipTests
+   (compiles, packages into WAR file)
+
+3. Run the application locally:
+   cd endeavour-application-app   (the deployable module)
+   mvn jetty:run
+   (starts embedded Jetty server on http://localhost:8080)
+
+4. Make your code change in the IDE
+
+5. Test it:
+   curl -X POST http://localhost:8080/programs/DEMO/members \
+        -H "Authorization: Bearer <token>" \
+        -H "Content-Type: application/json" \
+        -d '{"firstName":"Test", ...}'
+
+6. Run unit tests:
+   mvn test
+
+7. When happy, commit and push to Git
+```
+
+#### Phase 2: CI/CD Pipeline (Jenkins, automatic)
+
+```
+Git push
+    │
+    ▼
+Jenkins picks up the branch
+    │
+    ├── mvn verify (compile + unit tests + integration tests)
+    ├── SonarQube (code quality check)
+    └── If all pass → build Docker image → push to registry
+```
+
+#### Phase 3: Deployment (Puppet + AWS)
+
+```
+Docker image in registry
+    │
+    ▼
+Puppet applies configuration to target environment (DEV/QA/PROD)
+    │
+    ▼
+New container starts, old container stops (rolling deploy)
+    │
+    ▼
+Smoke tests run (is /health returning 200?)
+```
+
+---
+
+### 16.5) How Would You Build and Deploy PAW?
+
+PAW is a **new, separate Spring Boot service** — not a module inside `endeavour-application`. Here's the workflow:
+
+#### Development workflow for PAW:
+
+```
+1. Create new Git repo: paw-service (or a new module in the monorepo)
+
+2. Start the local environment:
+   docker compose up -d   ← mysql8, mongo, activemq, solr still needed
+                            (PAW needs MySQL for its own tables,
+                             and needs to talk to ALP-E which needs all four)
+
+3. Add PAW's own tables to MySQL:
+   CREATE DATABASE paw;
+   CREATE TABLE paw_graph_nodes (...);
+   CREATE TABLE paw_graph_edges (...);
+   CREATE TABLE paw_pending_events (...);
+
+4. Build PAW:
+   cd paw-service
+   mvn spring-boot:run
+   (starts on a different port, e.g., http://localhost:8081)
+
+5. PAW talks to local ALP-E:
+   PAW → POST http://localhost:8080/oauth/token         ← gets token
+   PAW → POST http://localhost:8080/programs/DEMO/...   ← posts interaction
+   Both running locally, talking to same Docker containers
+
+6. When happy, commit and push → CI/CD pipeline builds PAW's Docker image separately
+
+7. In production: PAW container + ALP-E containers run side by side
+   Both connect to the same MySQL server, same ActiveMQ, same MongoDB
+   But PAW has its own schema (paw_*) that ALP-E doesn't touch
+```
+
+#### What you would actually change if building PAW from scratch:
+
+| Task | Where | What you do |
+|---|---|---|
+| PAW's graph storage | New `paw-service` repo | Create Spring Boot project, Hibernate entities for nodes/edges |
+| PAW's calculation engine | New `paw-service` repo | Write Java service that traverses graph, calculates percentages |
+| PAW's ALP-E connector | New `paw-service` repo | `RestTemplate`/`WebClient` that calls ALP-E's REST APIs with OAuth2 token |
+| Register PAW as a TPA in ALP-E | ALP-E Config Web | Add OAuth client `paw-service` with the right scopes |
+| Add `PAW_HIERARCHY_OUTCOME` interaction type | ALP-E Config Web | Add new `ProgramInteractionType` record in MySQL |
+| Configure Marketing Unit for PAW events | ALP-E Config Web | Create a new MU that fires when `interactionType = PAW_HIERARCHY_OUTCOME` |
+
+**The key point:** You do NOT modify the ALP-E core code to add PAW. You configure ALP-E (through its Config Web UI, adding TPA credentials and interaction types), and you build PAW as a completely separate service. ALP-E never knows PAW exists — it just receives interactions from a registered client called "paw-service".
+
+---
+
+### 16.6) Summary: Why Each Piece Exists
+
+| Component | Type | Lives where | Why it exists |
+|---|---|---|---|
+| **MySQL 8** | Relational DB | Docker container locally / AWS RDS in production | The main data store — member records, programmes, balances, identities |
+| **MongoDB** | Document DB | Docker container locally / AWS DocumentDB in production | Event history (permanent audit log) + batch job staging |
+| **ActiveMQ** | Message broker | Docker container locally / AWS MQ in production | Async event bus — decouples core app from downstream services |
+| **Solr** | Search engine | Docker container locally / AWS EC2 in production | Full-text member search for Call Centre |
+| **Jetty** | Web server | Embedded in Maven locally / Tomcat in production | Hosts the WAR file, handles HTTP requests |
+| **Endeavour App** | Java WAR | `mvn jetty:run` locally / Tomcat container in production | The core loyalty engine — REST APIs, business logic, event raising |
+| **PAW Service** | Java JAR (Spring Boot) | `mvn spring-boot:run` locally / Docker container in production | Hierarchy calculation sidecar — talks to ALP-E via REST |
