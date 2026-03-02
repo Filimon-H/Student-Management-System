@@ -1,0 +1,2160 @@
+# PAW (Points at Work) — Design & Implementation Blueprint
+
+> **Version:** Sprint 2 Design Draft  
+> **Premise:** Build a B2B Representative Hierarchy engine as a **sidecar** to ELP, not a replacement.
+
+---
+
+## 1. What is PAW? (The Simple Version)
+
+### For a 5-Year-Old
+
+Imagine a company with salespeople. Alice is the boss. Bob works for Alice. Charlie works for Bob. When Charlie sells a toy, Charlie gets a gold star. Bob ALSO gets a silver star because Charlie is on his team. Alice gets a bronze star because Bob's whole team is under her.
+
+PAW knows **who works for who** and figures out **who gets which stars**.
+
+The old system (ELP) counts stars and gives prizes. But it only understands flat lists — not trees. PAW adds the tree.
+
+### For a Technical Audience
+
+PAW is a **DAG hierarchy engine** extending ELP's flat Member List Model. It provides:
+
+- **O(1) traversal** via Closure Tables (vs ELP's O(depth) recursive joins)
+- **Matrix reporting** (DAG) with strict-tree guardrails for commission safety
+- **Tenant isolation** per client organization
+- **Hybrid execution** — PAW resolves "who and what," ELP/Drools executes "the ledger credit"
+
+PAW is **not** a replacement. It is an **additive sidecar** that:
+1. Reads identity data FROM ELP (ELP = Identity Provider)
+2. Manages the org hierarchy in its OWN database
+3. Fires Terminal Events BACK to ELP for points/commission processing
+
+---
+
+## 2. Why PAW Exists — The Problem Statement
+
+### Problem 1: Member List Model Constraint
+
+ELP manages members as flat records in ODS. The Account Hierarchy feature (R9) links members to organizations but enforces **single-parent** at the DB level:
+- A rep cannot belong to two teams simultaneously (no matrix reporting)
+- Sprint 1 discovery: adding a second group link returns `"Target member already linked"`
+
+### Problem 2: Performance Tax — O(depth) vs O(1)
+
+ELP hierarchy queries use recursive JOINs:
+- 100 reps: ~5ms (ok)
+- 10,000 reps at 8 levels: ~400ms (sluggish)
+- 100,000 reps at 12 levels: ~2000ms+ (unusable)
+- **PAW with closure table: ~1-3ms at ANY size**
+
+### Problem 3: Commission Safety
+
+ELP's Drools assumes strict tree: one member → one earning path. If we allow DAG without guardrails, Drools could double-award. **PAW solution:** DB is DAG-capable (future-proof), API enforces STRICT_TREE for primary paths. Secondary edges are for visibility only.
+
+---
+
+## 3. The Hybrid Strategy — What We Use From ELP
+
+### Simple Version
+
+Building a new garage (PAW) next to the house (ELP). Share the front door (Identity/login), the mailbox (Events/ActiveMQ), and the safe (Points Bank). Garage has its own floor plan (hierarchy DB) and tools (graph engine).
+
+### What We TAKE From ELP (Don't Rebuild)
+
+| ELP Component | How PAW Uses It |
+|---|---|
+| **Identity Service** (`endeavour-identity`) | ALL PAW requests authenticate through ELP Identity OAuth2. Register PAW as a TPA with specific scopes. |
+| **Drools Rules Engine** (`endeavour-marketing`) | PAW sends Terminal Events. Drools handles actual points math. PAW never touches points bank directly. |
+| **Points Bank** (`endeavour-pointsbank-service`) | PAW tells ELP "credit 500 points to Dave." ELP does the ledger work. |
+| **Event Framework** (ActiveMQ + MongoDB) | PAW publishes to existing ActiveMQ Virtual Topic. ELP Event Hub consumes alongside other events. |
+| **Batch Service** (`endeavour-batch`) | Large re-orgs (10K+ reps) submitted through existing batch infrastructure. |
+| **Gateway Service** (`endeavour-gateway`) | PAW registers as Gateway Provider for receiving external HR/CRM feeds about org changes. |
+
+### What We BUILD New
+
+| PAW Component | Why We Can't Use ELP's |
+|---|---|
+| **Hierarchy Database** (own MySQL schema) | ELP's ODS enforces single-parent. We need DAG + Closure Table. |
+| **Graph Engine** (Java service) | ELP has no tree traversal, ancestor paths, or org roll-ups. |
+| **PAW REST API** (new endpoints) | ELP member API doesn't expose hierarchy operations. |
+| **Closure Table Manager** | ELP has no pre-computed path indexing. Core to O(1). |
+| **Table Swap Engine** | Zero-downtime re-orgs for the Faith persona. |
+
+### Architecture Diagram
+
+```
+┌──────────────── CLIENT / FRONTEND ──────────────────┐
+└───────┬──────────────────────────┬──────────────────┘
+        │ "Who reports to who?"    │ "Give Dave 500 pts"
+        ▼                         ▼
+ ┌──────────────┐        ┌──────────────────┐
+ │   PAW API    │──────▶ │   ELP REST API   │
+ │  (Hierarchy) │Terminal │ (Points, Members │
+ │  Port: 8920  │Events  │  Rewards, MUs)   │
+ └──────┬───────┘        └────────┬─────────┘
+        │     ┌──────────────┐    │
+        │     │ ELP Identity │    │
+        │     │ (OAuth2)     │    │
+        │     │ Port: 8911   │    │
+        ├─────┤──────────────┤────┤
+        ▼     ▼              ▼    ▼
+ ┌────────┐┌──────────┐┌──────────┐
+ │ PAW DB ││Identity  ││ ODS DB   │
+ │ paw_*  ││DB        ││ ods_*    │
+ └────────┘└──────────┘└──────────┘
+```
+
+**Key principle:** PAW owns hierarchy data. ELP owns financial transactions. They share auth (Identity) and messaging (ActiveMQ).
+
+---
+
+## 4. PAW Module Inventory — What We Must Build
+
+### Tier 1: MUST HAVE (Sprint 2-3) — MVP
+
+#### Module 1: `paw-data` — The Foundation Tables
+
+JPA/Hibernate entities + Flyway migrations for the PAW schema.
+
+```
+Tables:
+├── paw_tenant          → The company (Acme Corp). Tenant isolation root.
+├── paw_identity        → A person record, linked to ELP member ID.
+├── paw_org_unit        → A team/department node (ROOT + UNASSIGNED built-in).
+├── paw_membership      → Links person to team (PRIMARY / SECONDARY).
+├── paw_reporting_line  → Person-to-person manager relationship.
+└── paw_closure         → Pre-computed ancestor-descendant pairs for O(1).
+```
+
+**Dependencies from ELP:** None. PAW's own MySQL schema.
+
+#### Module 2: `paw-graph-engine` — The Brain
+
+Manages closure table rebuild, DAG validation, strict-tree enforcement, holding tank logic, and path resolution.
+
+```java
+public interface HierarchyService {
+    List<Identity> getDescendants(String ancestorId);   // O(1)
+    List<Identity> getAncestors(String descendantId);   // O(1)
+    List<OrgUnit> getRollUpPath(String nodeId);          // O(1)
+    void assignToTeam(String identityId, String orgUnitId, EdgeType type);
+    void moveSubtree(String nodeId, String newParentId);
+    ValidationResult validateStrictTree(String identityId);
+}
+```
+
+**Dependencies from ELP:** `endeavour-platform` (base service classes, validation framework).
+
+#### Module 3: `paw-api` — The Front Door
+
+RESTEasy (JAX-RS) endpoints secured via ELP Identity OAuth2 tokens.
+
+```
+POST   /api/v1/tenants                              → Create tenant
+GET    /api/v1/tenants/{id}/hierarchy/tree           → Full org tree
+POST   /api/v1/tenants/{id}/identities               → Create identity (→ UNASSIGNED)
+GET    /api/v1/hierarchy/{nodeId}/descendants         → O(1) subtree
+GET    /api/v1/hierarchy/{nodeId}/ancestors           → O(1) ancestor path
+POST   /api/v1/memberships                           → Assign person to team
+DELETE /api/v1/memberships/{id}                      → Remove (→ UNASSIGNED)
+POST   /api/v1/reporting-lines                       → Set manager relationship
+GET    /api/v1/hierarchy/{nodeId}/rollup             → Commission roll-up path
+POST   /api/v1/admin/reorg                           → Bulk re-org (async)
+```
+
+**Dependencies from ELP:** `endeavour-platform` (REST framework, security interceptors), `endeavour-identity` (token verification).
+
+#### Module 4: `paw-elp-bridge` — The Translator
+
+Syncs identity data FROM ELP, publishes Terminal Events TO ELP's ActiveMQ, translates PAW hierarchy into ELP-compatible Award Events.
+
+Terminal Event payload (PAW → ELP):
+```json
+{
+  "event_id": "evt_20260226_99b1",
+  "source": "PAW-Hierarchy-Service",
+  "payload_type": "AWARD_ELIGIBILITY_RESOLVED",
+  "subject": {
+    "representative_id": "rep_dave_001",
+    "elp_identity_id": "elp_user_8842"
+  },
+  "resolved_hierarchy": {
+    "primary_manager_id": "rep_bob_002",
+    "roll_up_path": ["ou_emea_sales", "ou_headquarters", "tenant_acme"],
+    "calculation_strategy": "STRICT_TREE_ENFORCED"
+  },
+  "instruction": {
+    "action": "TRIGGER_LEDGER_CREDIT",
+    "rule_set": "Standard_Sales_Commission_v2",
+    "points": 500
+  }
+}
+```
+
+**Dependencies from ELP:** `endeavour-platform-event`, `endeavour-commons-jms`, `endeavour-platform-payload`.
+
+### Tier 2: SHOULD HAVE (Sprint 4-5)
+
+- **`paw-closure-manager`** — Async/batched closure rebuilds for scale (10K+ reps)
+- **`paw-table-swap`** — Zero-downtime re-org via 3-table strategy (staging → prod → LKG)
+- **`paw-admin-ui`** — Visual org chart, drag-and-drop re-org, CSV import
+
+### Tier 3: NICE TO HAVE (Sprint 6+)
+
+- **`paw-analytics`** — Roll-up dashboards, team aggregation, historical snapshots
+- **`paw-audit`** — Full audit trail (who, when, what, why) for compliance
+- **`paw-sync`** — Automated sync with Workday / Salesforce / SAP SuccessFactors
+
+---
+
+## 5. Data Architecture — Schema & Storage
+
+### Simple Version
+
+We need 6 tables — like 6 spreadsheets:
+1. **Companies** — which company? (Acme Corp)
+2. **People** — who are the salespeople? (Alice, Bob, Charlie, Dave)
+3. **Teams** — what teams exist? (HQ, EMEA Sales, Special Projects, Unassigned)
+4. **Team Memberships** — who is on which team? (Dave → EMEA as PRIMARY, Dave → Special Projects as SECONDARY)
+5. **Manager Links** — who manages who? (Alice manages Bob, Bob manages Charlie)
+6. **The Elevator Index** — pre-computed shortcuts so we never climb stairs (Closure Table)
+
+### Full Schema
+
+```sql
+-- ============================================================
+-- TABLE 1: paw_tenant
+-- One row per client company. ALL other tables reference this.
+-- Guarantees Acme's data never leaks into another client's.
+-- ============================================================
+CREATE TABLE paw_tenant (
+    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+    uuid            VARCHAR(36) NOT NULL UNIQUE,
+    name            VARCHAR(255) NOT NULL,
+    code            VARCHAR(50) NOT NULL UNIQUE,
+    elp_program_code VARCHAR(50),
+    status          ENUM('ACTIVE','SUSPENDED','ARCHIVED') DEFAULT 'ACTIVE',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_tenant_code (code),
+    INDEX idx_tenant_elp (elp_program_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ============================================================
+-- TABLE 2: paw_identity
+-- Decoupled from ELP's member table. We store our OWN record
+-- and link back to ELP via elp_member_id. Decoupled because
+-- ELP's member model doesn't support hierarchy attributes.
+-- ============================================================
+CREATE TABLE paw_identity (
+    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+    uuid            VARCHAR(36) NOT NULL UNIQUE,
+    tenant_id       BIGINT NOT NULL,
+    elp_member_id   VARCHAR(255),
+    first_name      VARCHAR(100),
+    last_name       VARCHAR(100),
+    email           VARCHAR(255),
+    rep_code        VARCHAR(50),
+    status          ENUM('ACTIVE','INACTIVE','TERMINATED') DEFAULT 'ACTIVE',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (tenant_id) REFERENCES paw_tenant(id),
+    INDEX idx_identity_tenant (tenant_id),
+    INDEX idx_identity_elp (elp_member_id),
+    UNIQUE KEY uk_tenant_rep (tenant_id, rep_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ============================================================
+-- TABLE 3: paw_org_unit
+-- Tree structure for organizations. Special nodes: ROOT
+-- (invisible container) and UNASSIGNED (holding tank).
+-- Uses adjacency list for mutations + closure table for reads.
+-- ============================================================
+CREATE TABLE paw_org_unit (
+    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+    uuid            VARCHAR(36) NOT NULL UNIQUE,
+    tenant_id       BIGINT NOT NULL,
+    parent_org_unit_id BIGINT,
+    name            VARCHAR(255) NOT NULL,
+    code            VARCHAR(50) NOT NULL,
+    unit_type       ENUM('ROOT','DEPARTMENT','TEAM','UNASSIGNED') NOT NULL,
+    level           INT NOT NULL DEFAULT 0,
+    status          ENUM('ACTIVE','ARCHIVED') DEFAULT 'ACTIVE',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (tenant_id) REFERENCES paw_tenant(id),
+    FOREIGN KEY (parent_org_unit_id) REFERENCES paw_org_unit(id),
+    INDEX idx_org_tenant (tenant_id),
+    INDEX idx_org_parent (parent_org_unit_id),
+    UNIQUE KEY uk_tenant_code (tenant_id, code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ============================================================
+-- TABLE 4: paw_membership (Person ↔ Team — The Matrix Engine)
+-- A person can have ONE primary (for commissions) and
+-- MULTIPLE secondary (for visibility). API enforces max 1
+-- PRIMARY. DB allows multiple: future-proof for split commissions.
+-- ============================================================
+CREATE TABLE paw_membership (
+    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+    uuid            VARCHAR(36) NOT NULL UNIQUE,
+    tenant_id       BIGINT NOT NULL,
+    identity_id     BIGINT NOT NULL,
+    org_unit_id     BIGINT NOT NULL,
+    edge_type       ENUM('PRIMARY','SECONDARY') NOT NULL DEFAULT 'PRIMARY',
+    effective_from  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    effective_to    TIMESTAMP NULL,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tenant_id) REFERENCES paw_tenant(id),
+    FOREIGN KEY (identity_id) REFERENCES paw_identity(id),
+    FOREIGN KEY (org_unit_id) REFERENCES paw_org_unit(id),
+    INDEX idx_membership_identity (identity_id),
+    INDEX idx_membership_org (org_unit_id),
+    INDEX idx_membership_active (identity_id, effective_to)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ============================================================
+-- TABLE 5: paw_reporting_line (Person → Person manager link)
+-- Separate from org_unit membership because a person's manager
+-- might be in a different org_unit (dotted-line scenario).
+-- ============================================================
+CREATE TABLE paw_reporting_line (
+    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+    uuid            VARCHAR(36) NOT NULL UNIQUE,
+    tenant_id       BIGINT NOT NULL,
+    subordinate_id  BIGINT NOT NULL,
+    manager_id      BIGINT NOT NULL,
+    line_type       ENUM('PRIMARY','SECONDARY') NOT NULL DEFAULT 'PRIMARY',
+    effective_from  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    effective_to    TIMESTAMP NULL,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tenant_id) REFERENCES paw_tenant(id),
+    FOREIGN KEY (subordinate_id) REFERENCES paw_identity(id),
+    FOREIGN KEY (manager_id) REFERENCES paw_identity(id),
+    INDEX idx_reporting_sub (subordinate_id),
+    INDEX idx_reporting_mgr (manager_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ============================================================
+-- TABLE 6: paw_closure (The O(1) Elevator)
+-- For every ancestor-descendant pair, one row. This means
+-- "find all people under Alice" is ONE indexed SELECT.
+--
+-- Example for Alice(1) → Bob(2) → Charlie(3):
+--   (1,1,0)  Alice → self at depth 0
+--   (1,2,1)  Alice → Bob at depth 1
+--   (1,3,2)  Alice → Charlie at depth 2
+--   (2,2,0)  Bob → self at depth 0
+--   (2,3,1)  Bob → Charlie at depth 1
+--   (3,3,0)  Charlie → self at depth 0
+-- ============================================================
+CREATE TABLE paw_closure (
+    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+    tenant_id       BIGINT NOT NULL,
+    ancestor_id     BIGINT NOT NULL,
+    descendant_id   BIGINT NOT NULL,
+    depth           INT NOT NULL DEFAULT 0,
+    path_type       ENUM('ORG_UNIT','IDENTITY') NOT NULL,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tenant_id) REFERENCES paw_tenant(id),
+    INDEX idx_closure_ancestor (ancestor_id, path_type),
+    INDEX idx_closure_descendant (descendant_id, path_type),
+    UNIQUE KEY uk_closure_pair (ancestor_id, descendant_id, path_type)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### Why This Schema Works at Scale
+
+| Concern | Solution |
+|---|---|
+| **Tenant isolation** | Every table has `tenant_id`. All queries filtered by tenant. |
+| **O(1) lookups** | `paw_closure` eliminates recursive queries. Any traversal = 1 indexed SELECT. |
+| **Matrix reporting** | `paw_membership.edge_type` — PRIMARY + SECONDARY. DB allows it, API guards it. |
+| **Historical tracking** | `effective_from/to` on memberships and reporting lines. Never delete, just close date range. |
+| **ELP compatibility** | `elp_member_id` and `elp_program_code` link back without tight coupling. |
+
+---
+
+## 6. API Design — The Contracts
+
+### Error Response Contract
+
+All errors follow the same shape (consistent with ELP's patterns):
+
+```json
+{
+  "status": 400,
+  "error": "HIERARCHY_VIOLATION",
+  "message": "Multiple Primary Managers detected for User: Dave (DAVE004)",
+  "details": {
+    "identityId": "DAVE004",
+    "existingPrimary": "ou_emea_sales",
+    "attemptedPrimary": "ou_headquarters",
+    "constraint": "STRICT_TREE_ENFORCED"
+  },
+  "timestamp": "2026-03-01T14:00:00Z"
+}
+```
+
+### Pagination, Filtering, HATEOAS
+
+Consistent with ELP's REST conventions (see Integration API User Guide):
+- **Pagination:** `?page=0&size=50` query params, response includes `totalElements`, `totalPages`
+- **Filtering:** `?status=ACTIVE&edgeType=PRIMARY`
+- **HATEOAS links:** Each response includes `_links` with `self`, `next`, `prev` as ELP does
+- **JSON format:** All payloads JSON, `Content-Type: application/json`
+
+### Key Endpoint Behaviors
+
+| Endpoint | Key Behavior |
+|---|---|
+| `POST /identities` | Auto-creates PRIMARY membership to UNASSIGNED (Holding Tank) |
+| `POST /memberships` (PRIMARY) | Validates max-1-PRIMARY. Closes old UNASSIGNED membership. Rebuilds closure. |
+| `POST /memberships` (SECONDARY) | No strict-tree check. DAG edge for visibility only. |
+| `DELETE /memberships/{id}` | If last membership → auto-assign to UNASSIGNED. |
+| `POST /reporting-lines` | Validates no cycles (A→B→C→A forbidden). |
+| `GET /hierarchy/{id}/descendants` | Returns from closure table. O(1). Supports `?depth=N` filter. |
+| `GET /hierarchy/{id}/rollup` | Returns PRIMARY-only ancestor chain for commission calculation. |
+| `POST /admin/reorg` | Async (202 Accepted). Uses Table Swap for large ops. |
+
+---
+
+## 7. Authentication & Authorization — How Security Works
+
+### Simple Version
+
+A building with a security guard at the front door (ELP Identity). Everyone must show their badge. Guard gives a wristband (OAuth token). PAW checks wristband color:
+- **Green (Admin):** Rearrange the whole building (re-orgs, create tenants)
+- **Blue (Manager):** See their team, move people within it
+- **Yellow (Rep):** See own info and immediate team only
+
+### Technical Implementation
+
+#### Step 1: Register PAW as a TPA in ELP Identity
+
+Via ELP's Configuration Web (see `ALP-E R18 User Roles and Permissions` doc):
+
+```
+Client ID:     paw-hierarchy-service
+Client Secret: [generated secure secret]
+Scopes:        VIEW_PROGRAMME_INFO, MANAGE_MEMBER_PROFILE, VIEW_INTERACTIONS
+```
+
+#### Step 2: PAW Gets Its Service Token
+
+On startup, PAW calls ELP Identity for a service-to-service token:
+
+```
+POST https://identity.endeavourdemo.com/oauth/token?grant_type=client_credentials
+Authorization: Basic base64(paw-hierarchy-service:secret)
+```
+
+Response: `{ "access_token": "2YotnFZ...", "token_type": "bearer", "expires_in": 3600 }`
+
+This token is used for PAW → ELP API calls (fetching member data, posting events).
+
+#### Step 3: Frontend Authenticates Through ELP Identity
+
+When a user (Faith the Admin) logs into the PAW UI:
+
+1. Frontend redirects to ELP Identity login (`/oauth/token`)
+2. ELP Identity returns OAuth access token with user roles
+3. Frontend sends token to PAW API in `Authorization` header
+4. PAW validates token via ELP Identity's introspection endpoint
+5. PAW extracts roles and applies PAW-specific permissions
+
+#### Step 4: PAW Permission Model
+
+PAW adds its own permission layer on top of ELP roles:
+
+| ELP Role | PAW Permission | Access |
+|---|---|---|
+| System Admin | `PAW_ADMIN` | Create tenants, trigger re-orgs, Table Swap |
+| Programme Admin | `PAW_ORG_MANAGER` | Create/move org units, assign memberships |
+| Call Centre Agent | `PAW_TEAM_LEAD` | View own team hierarchy (read-only) |
+| TPA (External) | `PAW_READ_ONLY` | Query hierarchy data via API |
+
+```java
+@Path("/api/v1/admin/reorg")
+public class ReorgResource {
+    @POST
+    @RolesAllowed("PAW_ADMIN")
+    public Response triggerReorg(ReorgRequest request) { /* ... */ }
+}
+
+@Path("/api/v1/hierarchy/{nodeId}/descendants")
+public class HierarchyResource {
+    @GET
+    @RolesAllowed({"PAW_ADMIN", "PAW_ORG_MANAGER", "PAW_TEAM_LEAD", "PAW_READ_ONLY"})
+    public Response getDescendants(@PathParam("nodeId") String nodeId) {
+        // Team leads: additional check — can only see own subtree
+    }
+}
+```
+
+#### Why We Use ELP Identity (Not Build Our Own)
+
+1. **No duplicate user management** — All users already exist in ELP Identity's MySQL
+2. **Single Sign-On** — One login for ELP + PAW
+3. **Existing role infrastructure** — ELP has roles, permissions, TPA scopes
+4. **Battle-tested OAuth2** — Supports client_credentials, password, and refresh flows
+5. **Security compliance** — ELP already passed penetration testing
+
+---
+
+## 8. The Rule Engine — Hybrid Drools Integration
+
+### Simple Version
+
+Two workers in a factory:
+- **Worker 1 (PAW):** Reads the org chart — "Charlie sold something. His manager is Bob. Bob's manager is Alice. Here's the chain."
+- **Worker 2 (ELP/Drools):** Takes that chain — "Charlie gets 100 pts, Bob gets 50 pts (manager bonus), Alice gets 25 pts (director bonus)."
+
+Worker 1 does the **thinking** (who is connected to who). Worker 2 does the **math** (how many points). They never do each other's jobs.
+
+### Why We Don't Replace Drools
+
+ELP's Rules Engine is the most complex and battle-tested component:
+
+- **30+ Marketing Unit types** — Value, Basket, Location, Generic Action, Early Engagement, Annual Accumulator, Time Period Capping, Tier, etc.
+- **Each MU has configurable** tailoring (criteria), targeting (segments), and outcomes (awards)
+- **Production-proven** Drools rules running live loyalty programs for years
+- **Apache Camel routing** — Complex event orchestration between Endeavour App, Rules Engine, and action handlers
+- **MU priority groups** — Only one promotion per group fires per transaction
+
+**Rebuilding this = 12-18 months + massive risk.** Instead, PAW extends it.
+
+### The Hybrid Flow
+
+```
+1. External Event: "Dave closed Deal XYZ for $50,000" (from CRM via Gateway)
+       │
+2. PAW Resolves Hierarchy (O(1) via closure table):
+   │   Dave → Bob (PRIMARY manager)
+   │   Bob → Alice (PRIMARY manager)
+   │   Dave → Helen (SECONDARY - Special Projects, no commission)
+   │   Roll-up: [EMEA Sales, HQ, Acme Corp]
+   │   Traversal: 1.2ms
+       │
+3. PAW Fires Terminal Event → ActiveMQ Virtual Topic
+       │
+4. ELP Endeavour App Receives Event:
+   │   Creates Interaction (type: PAW_AWARD)
+   │   Routes to Rules Engine via Apache Camel
+       │
+5. Drools Executes Commission Rules:
+   │   MU "Sales Commission V2" fires
+   │   Dave: 500 pts (100% of base)
+   │   Bob: 250 pts (50% manager bonus)
+   │   Alice: 125 pts (25% director bonus)
+   │   Helen: 0 pts (SECONDARY = visibility only)
+       │
+6. Points Bank Updated:
+       Dave 500→1000, Bob 250→750, Alice 125→625
+       Events published to Event Hub (MongoDB)
+```
+
+### What Changes in Drools (Minimal)
+
+We add **one new custom MU type** using ELP's existing Custom MU extension point:
+
+```java
+// Plugs into ELP's existing MU framework
+// Uses documented Custom MU extension point (R8+)
+rule "PAW Sales Commission - Direct Rep"
+when
+    $interaction : Interaction(type == "PAW_AWARD", $payload : eventPayload)
+    $resolved : ResolvedHierarchy() from $payload.resolvedHierarchy
+then
+    // Award direct rep
+    award($interaction.memberId, $payload.instruction.points, "DIRECT_SALE");
+    // Award primary manager chain
+    for (String managerId : $resolved.rollUpPath) {
+        int bonus = calculateManagerBonus($payload.instruction.points, depth);
+        award(managerId, bonus, "MANAGER_ROLLUP");
+    }
+end
+```
+
+**Why only one new MU?** ELP already supports Custom MU development. We leverage the existing plugin mechanism instead of modifying the core Rules Engine. The MU is configured via Loyalty Toolkit like any other promotion — a marketer can adjust percentages, enable/disable it, and set targeting criteria without code changes.
+
+---
+
+## 9. Scalability Design — Thousands to Millions
+
+### Simple Version
+
+A phone book for 100 people — easy. A phone book for 1,000,000 people — if sorted alphabetically (indexed), just as fast. That's what our closure table indexes do.
+
+But if 100,000 people call at the same time? You need more operators (servers) and a smart switchboard (load balancer).
+
+### Tier 1: Single Tenant, <1,000 Reps (Sprint 2 Demo)
+
+```
+Architecture:  Single PAW instance + single MySQL
+Closure table: ~10,000 rows (1000 reps × ~10 avg depth)
+Memory:        ~256MB JVM heap
+Response time: <5ms for any traversal
+Throughput:    ~500 req/sec (single Jetty instance)
+```
+
+No special scaling. Everything runs on one box alongside ELP.
+
+### Tier 2: Multi-Tenant, 1,000–100,000 Reps per Tenant
+
+```
+Architecture:  2 PAW instances behind internal ALB
+Closure table: ~1M rows per tenant
+MySQL:         Read replica for queries, primary for writes
+Caching:       EhCache for hot closure paths (same tech as ELP)
+Response time: <5ms traversal, <50ms mutations
+Throughput:    ~2,000 req/sec across 2 instances
+```
+
+**Key changes:**
+- Read replicas for PAW database
+- Cache frequently-accessed closure paths (Alice's org hit 100x/day)
+- Closure rebuilds go async (queue via ActiveMQ)
+
+### Tier 3: Enterprise, 100,000–1M+ Reps Across Tenants
+
+```
+Architecture:  4+ PAW instances, auto-scaling group
+Closure table: ~100M rows across tenants
+MySQL:         Sharded by tenant_id (each large client = own DB)
+Caching:       Redis cluster for cross-instance consistency
+Response time: <10ms traversal, <200ms large mutations
+Throughput:    ~10,000 req/sec across cluster
+```
+
+**Key changes:**
+- Tenant-level database sharding
+- Redis replaces EhCache for cross-instance cache
+- Table Swap critical for 100K+ rep re-orgs
+- HikariCP connection pooling
+- Monitoring via Nagios + custom PAW health checks
+
+### 100M Daily Transaction Math
+
+```
+100M tx/day = ~1,157 TPS avg, ~5,000 TPS peak (4x burst)
+
+Per transaction:
+  1. PAW hierarchy resolution: 1 closure query (~1ms)
+  2. Terminal Event fire: 1 JMS publish (~2ms)
+  3. ELP Drools execution: existing pipeline (~50-100ms)
+
+PAW bottleneck = step 1+2 = ~3ms/tx
+At 5,000 TPS × 3ms = 15 concurrent threads needed
+Single Jetty handles 200+ threads → 1-2 PAW instances suffice
+
+ELP bottleneck = step 3 = ~50-100ms
+At 5,000 TPS = 250-500 concurrent Drools threads
+→ 4-8 App servers (ELP already supports horizontal scaling)
+```
+
+**Conclusion:** The O(1) closure table means **PAW is never the bottleneck**. ELP's Drools execution is the limiting factor, already addressed by ELP's horizontal scaling architecture.
+
+---
+
+## 10. Complete Sales Organization Use Case — Start to Finish
+
+**Acme Corp** — 500 reps, using ELP for commissions, adding PAW for hierarchical management. We follow one complete cycle: setup → login → sale → commissions awarded.
+
+---
+
+### Phase 1: SETUP — Building the Organization
+
+#### 1.1 Admin Creates Tenant
+
+Faith (System Admin) authenticates via ELP Identity, then:
+
+```
+POST /api/v1/tenants
+{ "name": "Acme Corp", "code": "ACME", "elpProgramCode": "ACME_LOYALTY" }
+```
+
+**Behind the scenes:**
+- PAW creates `paw_tenant` record
+- Auto-creates two system org units: `ROOT` (Level 0) and `UNASSIGNED` (Holding Tank, Level 1)
+- Verifies `ACME_LOYALTY` programme exists in ELP
+- Registers as event listener for ACME_LOYALTY member events on ActiveMQ
+
+#### 1.2 Admin Builds Org Structure
+
+```
+POST /api/v1/tenants/ACME/org-units
+{ "name": "Headquarters", "code": "HQ", "parentCode": "ROOT", "type": "DEPARTMENT" }
+
+POST /api/v1/tenants/ACME/org-units
+{ "name": "EMEA Sales", "code": "EMEA", "parentCode": "HQ", "type": "TEAM" }
+
+POST /api/v1/tenants/ACME/org-units
+{ "name": "Special Projects", "code": "SPROJ", "parentCode": "HQ", "type": "TEAM" }
+```
+
+Each POST creates an `paw_org_unit` row AND rebuilds closure table entries:
+```sql
+-- For "EMEA Sales" (id=3) under "HQ" (id=2) under "ROOT" (id=1):
+INSERT INTO paw_closure VALUES
+  (1, 3, 2, 'ORG_UNIT'),  -- ROOT → EMEA at depth 2
+  (2, 3, 1, 'ORG_UNIT'),  -- HQ → EMEA at depth 1
+  (3, 3, 0, 'ORG_UNIT');  -- EMEA → self at depth 0
+```
+
+#### 1.3 Admin Registers Reps
+
+```
+POST /api/v1/tenants/ACME/identities
+{ "firstName": "Alice", "repCode": "ALICE001", "elpMemberId": "elp_8840" }
+// ... Bob (BOB002/elp_8841), Charlie (CHARLIE003/elp_8842), Dave (DAVE004/elp_8843)
+```
+
+For each identity:
+1. Creates `paw_identity` row
+2. Calls ELP REST API to verify `elpMemberId` exists in ACME_LOYALTY
+3. Auto-creates PRIMARY membership to UNASSIGNED (Holding Tank)
+
+#### 1.4 Admin Assigns Reps to Teams
+
+```
+POST /api/v1/memberships
+{ "identityId": "ALICE001", "orgUnitId": "HQ", "edgeType": "PRIMARY" }
+
+POST /api/v1/memberships
+{ "identityId": "BOB002", "orgUnitId": "EMEA", "edgeType": "PRIMARY" }
+
+POST /api/v1/memberships
+{ "identityId": "DAVE004", "orgUnitId": "EMEA", "edgeType": "PRIMARY" }
+
+POST /api/v1/memberships
+{ "identityId": "DAVE004", "orgUnitId": "SPROJ", "edgeType": "SECONDARY" }
+```
+
+- PRIMARY assignment: closes old UNASSIGNED membership, creates new, rebuilds closure
+- SECONDARY assignment: no strict-tree check, adds DAG edge for visibility
+- If Dave already had a PRIMARY and we try another PRIMARY → **400 HIERARCHY_VIOLATION**
+
+#### 1.5 Admin Sets Manager Relationships
+
+```
+POST /api/v1/reporting-lines
+{ "subordinateId": "BOB002", "managerId": "ALICE001", "lineType": "PRIMARY" }
+
+POST /api/v1/reporting-lines
+{ "subordinateId": "DAVE004", "managerId": "BOB002", "lineType": "PRIMARY" }
+```
+
+**Final org state:**
+```
+Acme Corp (ROOT)
+├── Headquarters
+│   └── Alice (Org Lead) ─── manages → Bob
+├── EMEA Sales
+│   ├── Bob (Team Lead) ─── manages → Dave
+│   └── Dave (Rep) ─── also in → Special Projects (SECONDARY)
+└── Special Projects
+    └── Dave (SECONDARY, no commission from here)
+```
+
+---
+
+### Phase 2: AUTHENTICATION — Dave Logs In
+
+#### 2.1 Dave Authenticates via ELP Identity
+
+```
+POST https://identity.acme.aimia.com/oauth/token?grant_type=password
+Authorization: Basic base64(acme-sales-portal:secret)
+Body: username=dave@acme.com&password=***
+```
+
+ELP Identity responds:
+```json
+{
+  "access_token": "eyJhbGciOiJSUzI1NiJ9...",
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "scope": "VIEW_PROGRAMME_INFO VIEW_BALANCE"
+}
+```
+
+#### 2.2 Frontend Calls PAW with Dave's Token
+
+```
+GET /api/v1/tenants/ACME/identities/DAVE004
+Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...
+```
+
+PAW validates token with ELP Identity (`/oauth/check_token`), maps `elp_8843` → `DAVE004`, checks permissions, returns:
+
+```json
+{
+  "identity": { "repCode": "DAVE004", "firstName": "Dave", "status": "ACTIVE" },
+  "memberships": [
+    { "orgUnit": "EMEA Sales", "edgeType": "PRIMARY" },
+    { "orgUnit": "Special Projects", "edgeType": "SECONDARY" }
+  ],
+  "reportingLine": {
+    "primaryManager": { "repCode": "BOB002", "firstName": "Bob" }
+  },
+  "rollUpPath": ["EMEA Sales", "Headquarters", "Acme Corp"]
+}
+```
+
+---
+
+### Phase 3: THE SALE — Dave Closes a Deal
+
+Dave closes a $50,000 deal. The CRM fires a webhook.
+
+#### 3.1 Event Arrives via ELP Gateway
+
+```
+POST https://gateway.acme.aimia.com/api/v1/interactions
+Authorization: Bearer <Salesforce TPA token>
+{
+  "programCode": "ACME_LOYALTY",
+  "memberId": "elp_8843",
+  "interactionType": "SALE",
+  "value": 50000,
+  "metadata": { "dealId": "DEAL-XYZ-001" }
+}
+```
+
+ELP Gateway validates, publishes to ActiveMQ Virtual Topic.
+
+#### 3.2 PAW Listens and Resolves Hierarchy
+
+PAW's `ElpBridge` is listening on ActiveMQ for `INTERACTION/NEW` events:
+
+```java
+@JmsListener(destination = "VirtualTopic.endeavour.events")
+public void onInteraction(InteractionEvent event) {
+    if (!"SALE".equals(event.getInteractionType())) return;
+
+    // Map ELP member → PAW identity
+    PawIdentity rep = identityService.findByElpMemberId("elp_8843");
+    // rep = Dave (DAVE004)
+
+    // Resolve hierarchy via closure table (O(1), ~1.2ms)
+    HierarchyResolution resolution = hierarchyService.resolveRollUp("DAVE004");
+    // resolution.primaryPath = [Dave → Bob → Alice]
+    // resolution.strategy = STRICT_TREE_ENFORCED
+
+    // Fire Terminal Event back to ELP
+    TerminalEvent terminal = TerminalEvent.builder()
+        .subject(rep)
+        .resolvedHierarchy(resolution)
+        .instruction(new AwardInstruction("TRIGGER_LEDGER_CREDIT", 500))
+        .build();
+    elpBridge.fireTerminalEvent(terminal);
+}
+```
+
+#### 3.3 ELP Receives Terminal Event
+
+ELP's Endeavour Application Mediator receives the `AWARD_ELIGIBILITY_RESOLVED` event:
+1. Creates an Interaction of type `PAW_AWARD`
+2. Routes to Rules Engine via Apache Camel
+3. Drools fires the "Sales Commission V2" MU
+
+#### 3.4 Drools Calculates Commissions
+
+```
+MU "Sales Commission V2":
+  Dave (direct rep):  500 pts  (100% of base award)
+  Bob (level-1 mgr):  250 pts  (50% manager bonus)
+  Alice (level-2 mgr): 125 pts  (25% director bonus)
+  Helen (SECONDARY):    0 pts  (visibility only, no commission)
+```
+
+#### 3.5 Points Bank Updated
+
+ELP's Points Bank Service credits each account:
+```
+Dave:  balance 500 → 1000
+Bob:   balance 250 →  750
+Alice: balance 125 →  625
+```
+
+Events published to Event Hub (MongoDB) for audit trail and reporting. Gateway Service can push notifications to external systems.
+
+---
+
+### Phase 4: WHAT-IF — Dave Gets Reassigned (Re-Org)
+
+Faith needs to move Dave from EMEA Sales to a new APAC team.
+
+#### 4.1 Admin Triggers Re-Org
+
+```
+POST /api/v1/admin/reorg
+{
+  "operations": [
+    { "type": "MOVE", "identityId": "DAVE004", "fromOrg": "EMEA", "toOrg": "APAC" },
+    { "type": "CHANGE_MANAGER", "subordinateId": "DAVE004", "newManagerId": "GRACE005" }
+  ],
+  "strategy": "INLINE"
+}
+```
+
+**Behind the scenes:**
+1. Close Dave's EMEA membership (`effective_to = NOW`)
+2. Create new APAC membership (`edge_type = PRIMARY`)
+3. Close old reporting line (Bob → Dave)
+4. Create new reporting line (Grace → Dave)
+5. Rebuild closure table: delete all paths involving Dave under EMEA, insert new paths under APAC
+6. Dave's SECONDARY membership in Special Projects is **untouched**
+
+**After re-org:**
+```
+EMEA Sales
+└── Bob (no longer manages Dave)
+
+APAC Sales
+└── Grace ─── manages → Dave
+
+Special Projects
+└── Dave (SECONDARY, unchanged)
+```
+
+If Dave makes a sale tomorrow, PAW resolves: Dave → Grace → [APAC chain]. Drools awards accordingly.
+
+#### 4.2 Large-Scale Re-Org (Table Swap)
+
+For moving 5,000 reps between divisions:
+
+```
+POST /api/v1/admin/reorg
+{
+  "operations": [ /* 5000 move operations */ ],
+  "strategy": "TABLE_SWAP"
+}
+→ 202 Accepted, jobId: "reorg_20260301_001"
+```
+
+Table Swap process:
+1. Build new hierarchy in `paw_closure_staging` (background, ~30 seconds)
+2. Validate: no cycles, no orphans, all identities accounted for
+3. Atomic swap: `RENAME TABLE paw_closure TO paw_closure_lkg, paw_closure_staging TO paw_closure`
+4. Old table kept as `paw_closure_lkg` for 3-day rollback window
+5. Zero downtime — reads continue on whichever table name is `paw_closure`
+
+```
+GET /api/v1/admin/reorg/reorg_20260301_001/status
+→ { "status": "COMPLETED", "duration": "32s", "affectedIdentities": 5000 }
+```
+
+---
+
+## 11. Sprint 2 Implementation Roadmap
+
+### Week 1: Foundation
+
+| Day | Task | Deliverable |
+|---|---|---|
+| 1-2 | Create `paw-data` module: JPA entities, Flyway migrations for all 6 tables | Running DDL against local MySQL |
+| 3-4 | Create `paw-graph-engine`: ClosureTableManager, DAG validator, HierarchyService impl | Unit tests passing for closure rebuild, cycle detection |
+| 5 | Seed data: Acme Corp tenant, ROOT/UNASSIGNED, 4 test identities (Alice/Bob/Charlie/Dave) | Populated dev database matching the use case org chart |
+
+### Week 2: API + Bridge
+
+| Day | Task | Deliverable |
+|---|---|---|
+| 1-2 | Create `paw-api`: RESTEasy endpoints for tenants, identities, memberships, hierarchy queries | Postman collection with all endpoints callable |
+| 3-4 | Create `paw-elp-bridge`: ActiveMQ listener, Terminal Event publisher, ELP Identity token integration | Event round-trip: CRM → Gateway → PAW → ELP (in logs) |
+| 5 | Integration test: Full Acme Corp sales use case end-to-end | Dave's sale triggers hierarchy resolution + Drools awards all 3 managers |
+
+### Week 3: Hardening + Demo
+
+| Day | Task | Deliverable |
+|---|---|---|
+| 1-2 | Strict-tree enforcement, Holding Tank auto-assignment, error handling | All edge cases covered (duplicate PRIMARY, orphan, cycle) |
+| 3 | Performance validation: 1,000 reps, measure closure query latency | Sub-5ms confirmed for all traversal queries |
+| 4 | Demo preparation: Postman demo script, sample data, walkthrough doc | Ready for stakeholder presentation |
+| 5 | Sprint review + retrospective | Sprint 2 complete, Sprint 3 plan drafted |
+
+### Sprint 2 Definition of Done
+
+- [ ] All 6 PAW tables created and migrated
+- [ ] Closure table rebuilds correctly on every hierarchy mutation
+- [ ] Strict-tree violation returns 400 with clear error message
+- [ ] New identity auto-assigned to UNASSIGNED
+- [ ] Removal of last membership auto-assigns to UNASSIGNED
+- [ ] All API endpoints authenticated via ELP Identity OAuth2 token
+- [ ] Terminal Event successfully consumed by ELP Drools
+- [ ] End-to-end Acme Corp demo: setup → sale → commission → re-org
+- [ ] Sub-5ms hierarchy traversal at 1,000 reps confirmed
+
+---
+
+## 12. Risk Register & Mitigation
+
+| # | Risk | Impact | Probability | Mitigation |
+|---|---|---|---|---|
+| R1 | **ELP build still blocked** (missing internal artifacts from dead Artifactory) | Cannot integration-test PAW↔ELP bridge | HIGH | Obtain teammate's `~/.m2/repository/com/ga/endeavour` cache. PAW modules can be developed/tested standalone with mocks until ELP runs locally. |
+| R2 | **Drools custom MU complexity** | May need deeper knowledge of ELP's MU plugin system to create PAW_AWARD MU | MEDIUM | Study `endeavour-marketing` module structure, MU configuration docs. Start with a simple "pass-through" MU that logs the award, then add real points logic. |
+| R3 | **ActiveMQ event format mismatch** | PAW Terminal Events may not match ELP's expected event schema | MEDIUM | Read `endeavour-platform-event` source for exact event DTOs. Match payload structure to ELP's `eventFamily`/`eventType` conventions documented in Event Framework guide. |
+| R4 | **Closure table row explosion at scale** | For N nodes with average depth D, closure has ~N×D rows. At 100K nodes × 10 depth = 1M rows per tenant. | LOW | Acceptable for MySQL with proper indexing. At extreme scale (1M+ nodes), partition by tenant_id. Monitored via row count alerts. |
+| R5 | **ELP Identity token validation latency** | Every PAW request requires an ELP Identity call to validate token | MEDIUM | Cache validated tokens locally in PAW (EhCache, TTL = token expiry). First call validates, subsequent calls hit cache. |
+| R6 | **Schema migration conflicts** | PAW Flyway migrations may conflict with ELP's DBDeploy if sharing MySQL instance | LOW | PAW uses its own database/schema (`paw_db`), completely separate from ELP's `endeavour_ods`. No conflict possible. |
+| R7 | **Team resistance to hybrid architecture** | Developers may prefer monolith (add to ELP) or full microservice (no ELP dependency) | MEDIUM | This document serves as justification. Hybrid = smallest delta, maximum reuse, lowest risk. Sidecar can be deployed/scaled independently while leveraging proven ELP components. |
+
+---
+
+## Appendix A: Glossary
+
+| Term | Definition |
+|---|---|
+| **ELP** | Endeavour Loyalty Platform — the existing Aimia platform (Java/Spring/Drools/MySQL) |
+| **PAW** | Points at Work — the new hierarchy sidecar service |
+| **Closure Table** | A pre-computed table storing every ancestor-descendant pair for O(1) graph queries |
+| **DAG** | Directed Acyclic Graph — a tree that allows multiple parents (but no cycles) |
+| **Strict Tree** | API-enforced constraint: max 1 PRIMARY parent per identity (commission safety) |
+| **Terminal Event** | The event PAW fires to ELP after resolving hierarchy, instructing Drools what to award |
+| **Holding Tank** | The UNASSIGNED org unit where new/orphaned identities are auto-placed |
+| **Table Swap** | Atomic rename of staging→production closure table for zero-downtime re-orgs |
+| **MU** | Marketing Unit — ELP's configurable promotion/rule entity executed by Drools |
+| **TPA** | Third Party Application — ELP's concept of an external system with OAuth credentials |
+| **ODS** | Operational Data Store — ELP's core MySQL schema |
+
+## Appendix B: ELP Documentation Cross-Reference
+
+| PAW Design Decision | ELP Document Referenced |
+|---|---|
+| OAuth2 TPA registration | ALP-E R18 User Roles and Permissions Configuration User Guide |
+| REST API conventions, HATEOAS, JSON | ALP-E R18 Integration API User Guide |
+| Event framework, ActiveMQ Virtual Topics | ALP-E R18 Event Framework |
+| MU types, Custom MU extension | ALP-E R18 Configuring and Running Marketing Units |
+| Architecture (SOA/ROA/EDA), deployment tiers | ALP-E R18 Architecture Manual |
+| Technology stack, AWS deployment | ALP-E R18 Technical Features Overview |
+| Programme configuration, currencies, rewards | ALP-E R18 Programme Level Configuration User Guide |
+| Platform configuration, partners, tokens | ALP-E R18 Platform Level Configuration User Guide |
+
+---
+
+---
+
+## 13. Design Review — Issues, Gaps & Improvement Suggestions
+
+> Now that we have a deep understanding of ELP's actual codebase, architecture, event framework, identity service, Drools rules engine, and deployment model, this section reviews the **original PAW proposal** and identifies what could be wrong, what's missing, and what could be improved.
+
+---
+
+### PART A: Potential Issues in the Original Proposal
+
+#### Issue 1: The Terminal Event Payload Is Invented — Not ELP-Compatible
+
+**The problem:** The original proposal defines a custom JSON payload (`AWARD_ELIGIBILITY_RESOLVED`) with fields like `representative_id`, `resolved_hierarchy`, and `instruction`. This format was **invented** — it doesn't match ELP's actual event schema.
+
+**What ELP actually does:** ELP events follow a strict structure documented in the Event Framework guide:
+- Every event has `eventFamily`, `eventType`, `eventId`, `eventDateTime`
+- Payloads are wrapped in a `details` map with specific key naming conventions
+- Events are published to ActiveMQ Virtual Topics with naming pattern `VirtualTopic.endeavour.events`
+- The Endeavour Application Mediator expects specific event families (ACCUMULATION, INTERACTION, MEMBER, etc.)
+
+**The fix:** The Terminal Event must be reformatted to match ELP's real event schema. Example:
+```json
+{
+  "eventFamily": "INTERACTION",
+  "eventType": "PAW_AWARD_RESOLVED",
+  "eventId": "evt_20260226_99b1",
+  "eventDateTime": "2026-02-26T14:00:00Z",
+  "programCode": "ACME_LOYALTY",
+  "details": {
+    "memberId": "elp_user_8842",
+    "interactionType": "PAW_AWARD",
+    "primaryManagerMemberId": "elp_user_8841",
+    "rollUpPath": "ou_emea_sales,ou_headquarters,tenant_acme_corp",
+    "calculationStrategy": "STRICT_TREE_ENFORCED",
+    "points": 500,
+    "ruleSet": "Standard_Sales_Commission_v2"
+  }
+}
+```
+The original `representative_id` field is also wrong — ELP doesn't know PAW rep IDs. It needs `memberId` (the ELP member ID).
+
+**Impact:** HIGH. Without matching ELP's event schema, the Endeavour Application Mediator will silently drop the event. No points will ever be awarded.
+
+---
+
+#### Issue 2: Closure Table Write Cost Is Underestimated
+
+**The problem:** The original proposal focuses heavily on O(1) read performance but barely mentions the **write cost** of maintaining the closure table. Every hierarchy mutation (add node, move node, delete node) requires:
+- Deleting all existing closure rows for the affected subtree
+- Recalculating and inserting new rows for every ancestor-descendant pair
+
+For a move operation on a node with 500 descendants at depth 10:
+- **Delete:** ~5,000 rows
+- **Insert:** ~5,000 new rows
+- Under transaction isolation, this locks significant portions of the closure table
+
+**What the proposal says:** "O(1) for everything" — which is only true for reads.
+
+**The fix:** Be explicit about the read/write tradeoff:
+- Reads: O(1) — confirmed, this is the core strength
+- Single node insert: O(depth) — insert one row per ancestor
+- Subtree move: O(subtree_size × depth) — can be expensive
+- Full rebuild: O(N²) worst case for N nodes
+
+For Sprint 2 with <1,000 reps, this doesn't matter. But at 100K+ reps, large re-orgs MUST use the async Table Swap strategy — not inline mutations. The original proposal mentions Table Swap but doesn't make it mandatory for large operations.
+
+**Recommendation:** Add a hard threshold — any mutation affecting >100 nodes must use TABLE_SWAP strategy. The API should auto-detect this and return `202 Accepted` instead of attempting inline.
+
+---
+
+#### Issue 3: No Concurrency Control on Hierarchy Mutations
+
+**The problem:** The original proposal doesn't address what happens when two admins modify the hierarchy simultaneously. Example:
+- Admin A moves Dave from EMEA to APAC
+- Admin B (at the same time) moves Bob's entire EMEA team to a new division
+- Both trigger closure rebuilds — one will see stale data
+
+**What ELP does:** ELP uses optimistic locking (`@Version` column on JPA entities) and database-level row locking via Spring's `@Transactional`.
+
+**The fix:** Add to the schema:
+```sql
+ALTER TABLE paw_org_unit ADD COLUMN version BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE paw_membership ADD COLUMN version BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE paw_reporting_line ADD COLUMN version BIGINT NOT NULL DEFAULT 0;
+```
+Use JPA `@Version` annotation. If a concurrent modification is detected, return `409 Conflict` with a clear message telling the admin to retry.
+
+**Impact:** MEDIUM. Unlikely in Sprint 2 demo with one admin, but a real production issue.
+
+---
+
+#### Issue 4: The "paw_closure" Table Mixes Two Unrelated Graphs
+
+**The problem:** The closure table has a `path_type` column with values `ORG_UNIT` and `IDENTITY`, storing both organizational hierarchy paths and person-to-person reporting paths in the same table. This creates:
+- Larger index scans (every query must filter by `path_type`)
+- Confusion about what a "path" means — is it org structure or reporting chain?
+- Risk of accidental cross-contamination in queries
+
+**The fix:** Consider splitting into two tables:
+- `paw_closure_org` — Org unit tree paths only
+- `paw_closure_reporting` — Person-to-person reporting chain paths
+
+This makes each table smaller, indexes more efficient, and the code clearer. The Table Swap can also be done independently for each — a re-org that only changes reporting lines doesn't need to rebuild the org unit closure.
+
+**Impact:** LOW for Sprint 2, MEDIUM at scale. Worth doing early before the schema is locked.
+
+---
+
+#### Issue 5: No Mention of ELP's Existing Account Hierarchy Feature
+
+**The problem:** The original proposal says "ELP doesn't natively support complex hierarchy" — but ELP actually has an **Account Hierarchy** feature (introduced in R9). This feature:
+- Links members to organizations
+- Supports single-parent trees
+- Has existing API endpoints for hierarchy management
+
+Sprint 1 discovered it enforces single-parent (the "Target member already linked" error). But the original proposal doesn't discuss whether PAW should **replace** or **coexist** with ELP's Account Hierarchy.
+
+**The fix:** Be explicit: PAW does NOT replace Account Hierarchy. PAW creates a parallel, richer hierarchy in its own database. For members that exist in both systems:
+- ELP Account Hierarchy: keeps the simple "member belongs to organization" link (for ELP's own reporting)
+- PAW: manages the complex DAG, manager chains, and commission roll-ups
+
+The `paw-elp-bridge` should sync the PRIMARY membership back to ELP's Account Hierarchy so that ELP's existing reports still work.
+
+**Impact:** MEDIUM. If ignored, stakeholders will ask "why are we building hierarchy when ELP already has it?"
+
+---
+
+#### Issue 6: The Demo Script Assumes CRM Integration That Doesn't Exist Yet
+
+**The problem:** The Sprint 2 use case shows a CRM (Salesforce) sending a sale event to ELP Gateway, which PAW then listens to. But:
+- There's no CRM integration configured
+- ELP Gateway needs a Gateway Provider plugin configured for the external system
+- The event format from a CRM won't match ELP's expected `INTERACTION/NEW` schema
+
+**The fix:** For Sprint 2, simulate the CRM event with a direct API call:
+```
+POST /api/v1/interactions (to ELP)
+```
+or even simpler — have PAW expose its own test endpoint:
+```
+POST /api/v1/test/simulate-sale
+{ "repCode": "DAVE004", "dealValue": 50000 }
+```
+This bypasses the CRM integration question entirely and lets us validate the hierarchy → Drools → Points Bank flow.
+
+**Impact:** HIGH for demo. The demo will fail if it depends on CRM integration that hasn't been built.
+
+---
+
+### PART B: What's Missing From the Original Proposal
+
+#### Gap 1: No Data Migration Strategy
+
+**What's missing:** How do we get existing ELP members into PAW? If Acme Corp already has 500 reps in ELP's member table, someone needs to:
+1. Extract all member records from ELP
+2. Create corresponding `paw_identity` records
+3. Build the initial org structure (who goes where)
+4. Establish reporting lines
+5. Build the initial closure table
+
+**What we need:**
+- A `paw-import` module or CLI tool: `paw-import --tenant=ACME --source=elp`
+- CSV import capability for initial org charts (provided by HR)
+- Idempotent import — safe to re-run if it fails halfway
+- Validation report: "500 members found, 498 matched, 2 unmatched (no email)"
+
+---
+
+#### Gap 2: No Monitoring, Health Checks, or Alerting
+
+**What's missing:** The proposal doesn't address operational visibility:
+- How do we know PAW is healthy?
+- How do we know the closure table is consistent?
+- What if events are piling up in ActiveMQ and PAW isn't processing them?
+
+**What we need:**
+- **Health endpoint:** `GET /api/v1/health` returning DB connectivity, ActiveMQ connection, closure table row count
+- **Closure integrity check:** Scheduled job that validates `paw_closure` matches the adjacency model (no orphan paths, no missing paths)
+- **Event lag monitor:** Alert if PAW's ActiveMQ consumer falls behind by >1,000 messages
+- **Nagios integration:** PAW registers with the same Nagios instance ELP uses (documented in Technical Features Overview)
+
+---
+
+#### Gap 3: No Rollback Strategy for Bad Hierarchy Changes
+
+**What's missing:** Table Swap has a 3-day LKG rollback, but what about individual bad changes? If an admin accidentally moves 50 people to the wrong team, the proposal doesn't explain how to undo it.
+
+**What we need:**
+- **Audit log:** Every mutation logged to `paw_audit_log` with before/after state
+- **Undo endpoint:** `POST /api/v1/admin/undo/{auditId}` — reverses a specific change
+- **Soft deletes everywhere:** Never hard-delete memberships or reporting lines. Close them with `effective_to` and create new ones. This means any state can be reconstructed at any point in time.
+
+The schema already has `effective_from/to` — good. But there's no audit table or undo capability in the proposal.
+
+---
+
+#### Gap 4: No Handling of ELP Member Lifecycle Events
+
+**What's missing:** When ELP creates, suspends, or terminates a member, PAW needs to react:
+- **Member created in ELP:** Should PAW auto-create a `paw_identity` and put them in UNASSIGNED?
+- **Member suspended in ELP:** Should PAW mark them INACTIVE? What happens to their reporting line — do their subordinates get orphaned?
+- **Member terminated in ELP:** The "Greg" persona mentions this but the proposal has no concrete implementation.
+
+**What we need:**
+- PAW listens for `MEMBER/CREATED`, `MEMBER/UPDATED`, `MEMBER/SUSPENDED` events on ActiveMQ (these exist — documented in Event Framework)
+- Auto-sync logic: ELP member status change → PAW identity status change → subordinate reassignment if needed
+- Grace period for terminated members: keep in system for 90 days for historical reporting, then archive
+
+---
+
+#### Gap 5: No Multi-Timezone Handling
+
+**What's missing:** ELP explicitly supports multi-timezone operations (documented in Integration API User Guide). The PAW schema stores `TIMESTAMP` columns which default to the MySQL server timezone.
+
+**What we need:**
+- Store all timestamps as UTC in the database
+- API responses include timezone-aware ISO 8601 timestamps
+- `effective_from/to` on memberships must respect the tenant's configured timezone (a transfer at "midnight London time" is different from "midnight Tokyo time")
+
+---
+
+#### Gap 6: No Rate Limiting or Abuse Protection on PAW API
+
+**What's missing:** PAW exposes a public REST API. There's no mention of:
+- Rate limiting per TPA client
+- Request size limits (a bulk re-org with 100,000 operations in one POST)
+- Throttling for closure-heavy operations
+
+**What we need:**
+- Rate limit: 1,000 requests/minute per TPA (configurable per tenant)
+- Max batch size: 500 operations per re-org request (larger → must use TABLE_SWAP)
+- Reject payloads > 1MB
+
+---
+
+#### Gap 7: No Frontend Architecture Decision
+
+**What's missing:** The original proposal mentions "Admin UI" as a Tier 2 module but doesn't say what technology to use. ELP's existing admin tools use **Backbone.js** — a framework from 2010 that's essentially unmaintained.
+
+**The decision needed:**
+- **Option A: Build PAW Admin UI with Backbone.js** — Consistent with existing ELP UIs. Developers familiar with it. But Backbone.js is dead technology, hard to hire for, no ecosystem.
+- **Option B: Build PAW Admin UI with React/Vue** — Modern, maintainable, better developer experience. But inconsistent with existing ELP admin UIs.
+- **Option C: No separate UI — extend Configuration Web** — Add a "Hierarchy" tab to ELP's existing Configuration Web (Backbone.js). Smallest effort, most integrated.
+
+**Recommendation:** Option C for Sprint 2 (add a tab to Config Web using Backbone.js for consistency), Option B for long-term (standalone PAW Admin portal in React if PAW grows into its own product).
+
+---
+
+#### Gap 8: No Testing Strategy
+
+**What's missing:** The acceptance criteria define pass/fail conditions but don't specify:
+- Unit test framework (JUnit 4? JUnit 5? ELP uses JUnit 4 + Mockito)
+- Integration test approach (embedded MySQL? H2? Testcontainers?)
+- How to test the ActiveMQ bridge without a running ELP instance
+- Performance test tool for the O(1) benchmark (JMH? manual timing?)
+
+**What we need:**
+- **Unit tests:** JUnit 4 + Mockito (matching ELP's existing test stack)
+- **Integration tests:** Testcontainers with MySQL 8 + ActiveMQ for realistic testing
+- **Mock ELP bridge:** For testing without running ELP locally (this is critical since ELP build is currently blocked)
+- **Performance benchmark:** JMH microbenchmark for closure table queries at 1K, 10K, 100K nodes
+- **Contract tests:** Validate Terminal Event JSON against ELP's expected schema before integration testing
+
+---
+
+### PART C: Improvement Ideas
+
+#### Idea 1: Add a "Simulation Mode" for Re-Orgs
+
+Before Faith commits a large re-org, let her preview the impact:
+```
+POST /api/v1/admin/reorg/simulate
+{ "operations": [...] }
+→ 200 OK
+{
+  "affectedIdentities": 347,
+  "brokenReportingLines": 12,
+  "newOrphans": 0,
+  "estimatedDuration": "8s",
+  "closureRowsDeleted": 4200,
+  "closureRowsInserted": 3800
+}
+```
+This is cheap to compute (just run validation without committing) and gives admins confidence before pressing "go."
+
+---
+
+#### Idea 2: Event Sourcing for Hierarchy History
+
+Instead of just `effective_from/to` timestamps, store every hierarchy change as an immutable event:
+```sql
+CREATE TABLE paw_hierarchy_event (
+    id          BIGINT PRIMARY KEY AUTO_INCREMENT,
+    tenant_id   BIGINT NOT NULL,
+    event_type  ENUM('MEMBER_ASSIGNED','MEMBER_MOVED','MANAGER_CHANGED','ORG_CREATED','REORG_EXECUTED'),
+    actor_id    VARCHAR(255),
+    payload     JSON,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+This enables:
+- "Show me the org chart as it was on January 15th" (point-in-time reconstruction)
+- "Who moved Dave and when?" (audit trail)
+- Replay capability for disaster recovery
+
+---
+
+#### Idea 3: Webhook Notifications for Hierarchy Changes
+
+External systems (CRM, HR, BI dashboards) may need to know when the org chart changes:
+```
+POST /api/v1/tenants/ACME/webhooks
+{ "url": "https://salesforce.acme.com/webhook/org-change", "events": ["MEMBER_MOVED", "MANAGER_CHANGED"] }
+```
+This is cleaner than making external systems poll PAW's API.
+
+---
+
+#### Idea 4: "Effective-Dated" Future Changes
+
+Allow admins to schedule hierarchy changes for a future date:
+```
+POST /api/v1/memberships
+{ "identityId": "DAVE004", "orgUnitId": "APAC", "edgeType": "PRIMARY", "effectiveFrom": "2026-04-01T00:00:00Z" }
+```
+The change is stored immediately but doesn't take effect until April 1st. A scheduler activates it at midnight. This is common in HR systems and would differentiate PAW from simpler tools.
+
+---
+
+#### Idea 5: Hierarchy Diff Endpoint
+
+For frontend visualization — show what changed between two points in time:
+```
+GET /api/v1/tenants/ACME/hierarchy/diff?from=2026-01-01&to=2026-03-01
+→ { "added": [...], "removed": [...], "moved": [...] }
+```
+
+---
+
+#### Idea 6: Commission Split Preview
+
+Before a sale is processed, allow the API to preview what the commission distribution would look like:
+```
+GET /api/v1/tenants/ACME/identities/DAVE004/commission-preview?points=500
+→ {
+    "directRep": { "id": "DAVE004", "points": 500 },
+    "managerChain": [
+      { "id": "BOB002", "points": 250, "depth": 1 },
+      { "id": "ALICE001", "points": 125, "depth": 2 }
+    ],
+    "totalPayout": 875
+  }
+```
+This is useful for sales ops planning and "what-if" scenarios without actually triggering Drools.
+
+---
+
+### Summary Table
+
+| # | Category | Issue / Gap | Severity | When to Fix |
+|---|---|---|---|---|
+| I1 | **Issue** | Terminal Event format doesn't match ELP schema | HIGH | Sprint 2 |
+| I2 | **Issue** | Closure write cost underestimated | MEDIUM | Sprint 2 (document), Sprint 4 (enforce threshold) |
+| I3 | **Issue** | No concurrency control on mutations | MEDIUM | Sprint 3 |
+| I4 | **Issue** | Closure table mixes org + reporting paths | LOW | Sprint 2 (split early) |
+| I5 | **Issue** | Doesn't address ELP's existing Account Hierarchy | MEDIUM | Sprint 2 (document stance) |
+| I6 | **Issue** | Demo depends on CRM integration that doesn't exist | HIGH | Sprint 2 (add test endpoint) |
+| G1 | **Gap** | No data migration strategy | HIGH | Sprint 3 |
+| G2 | **Gap** | No monitoring / health checks | MEDIUM | Sprint 3 |
+| G3 | **Gap** | No rollback for individual bad changes | MEDIUM | Sprint 3 |
+| G4 | **Gap** | No handling of ELP member lifecycle events | HIGH | Sprint 3 |
+| G5 | **Gap** | No multi-timezone handling | LOW | Sprint 4 |
+| G6 | **Gap** | No rate limiting / abuse protection | LOW | Sprint 4 |
+| G7 | **Gap** | No frontend architecture decision | MEDIUM | Sprint 2 (decide), Sprint 4 (build) |
+| G8 | **Gap** | No testing strategy | HIGH | Sprint 2 |
+| A1 | **Idea** | Simulation mode for re-orgs | Nice to have | Sprint 4 |
+| A2 | **Idea** | Event sourcing for history | Nice to have | Sprint 5 |
+| A3 | **Idea** | Webhook notifications | Nice to have | Sprint 5 |
+| A4 | **Idea** | Effective-dated future changes | Nice to have | Sprint 5 |
+| A5 | **Idea** | Hierarchy diff endpoint | Nice to have | Sprint 6 |
+| A6 | **Idea** | Commission split preview | Nice to have | Sprint 4 |
+
+---
+
+## 14. ELP Module Dependencies — What PAW Extends and How to Run Together
+
+> This section explains which ELP modules PAW depends on, how to run them together in development, and what needs to be running for PAW to function.
+
+---
+
+### The Core Principle: PAW is a Sidecar, Not a Fork
+
+PAW does **not** fork or modify ELP's codebase. It runs as a separate service alongside ELP, sharing infrastructure (MySQL, ActiveMQ, Identity) but maintaining its own codebase and deployment lifecycle.
+
+---
+
+### Required ELP Modules (Must Be Running)
+
+For PAW to function, these ELP services must be running and accessible:
+
+#### 1. `endeavour-identity` — The Authentication Gateway
+
+**What it is:** ELP's OAuth2 Identity Service (port 8911)
+
+**Why PAW needs it:**
+- All PAW API requests validate tokens via ELP Identity's `/oauth/check_token` endpoint
+- PAW registers as a TPA (Third Party Application) in ELP Identity
+- Users authenticate through ELP Identity, PAW receives the token
+
+**How to run:**
+```bash
+cd /Users/macbookpro/aimia/infrastructure/endeavour-identity/endeavour-identity
+mvn jetty:run
+# Runs on http://localhost:8911
+```
+
+**PAW configuration:**
+```properties
+# paw-application.properties
+elp.identity.url=http://localhost:8911
+elp.identity.client-id=paw-hierarchy-service
+elp.identity.client-secret=${PAW_CLIENT_SECRET}
+elp.identity.token-check-endpoint=/oauth/check_token
+```
+
+---
+
+#### 2. `endeavour-application` — The Core Loyalty Engine
+
+**What it is:** ELP's main application service with Mediator, Rules Engine integration, Points Bank (port 8910)
+
+**Why PAW needs it:**
+- Receives Terminal Events from PAW (via ActiveMQ)
+- Routes events to Drools Rules Engine for commission calculation
+- Updates Points Bank with awarded commissions
+- Provides REST API for member lookup (`GET /programs/{code}/members/{id}`)
+
+**How to run:**
+```bash
+cd /Users/macbookpro/aimia/infrastructure/endeavour-application/endeavour-application-web
+mvn jetty:run
+# Runs on http://localhost:8910
+```
+
+**PAW configuration:**
+```properties
+# paw-application.properties
+elp.application.url=http://localhost:8910
+elp.application.api-base=/api/v1
+```
+
+---
+
+#### 3. ActiveMQ — The Event Bus
+
+**What it is:** Message queue for event-driven communication (port 61616 broker, 8161 admin console)
+
+**Why PAW needs it:**
+- PAW publishes Terminal Events to `VirtualTopic.endeavour.events`
+- PAW listens for `INTERACTION/NEW` events (sales from CRM)
+- PAW listens for `MEMBER/CREATED`, `MEMBER/UPDATED` events (lifecycle sync)
+
+**How to run:**
+```bash
+# Via Docker (from buildAllTheThings.sh)
+docker run -d --name activemq \
+  -p 61616:61616 \
+  -p 8161:8161 \
+  rmohr/activemq:5.15.9
+```
+
+**PAW configuration:**
+```properties
+# paw-application.properties
+spring.activemq.broker-url=tcp://localhost:61616
+spring.activemq.user=admin
+spring.activemq.password=admin
+paw.events.topic=VirtualTopic.endeavour.events
+```
+
+---
+
+#### 4. MySQL — Shared Database Infrastructure
+
+**What it is:** Database server hosting both ELP's `endeavour_ods` and PAW's `paw_db` schemas
+
+**Why PAW needs it:**
+- PAW stores its own tables in `paw_db` schema
+- PAW may query ELP's `endeavour_ods` for member verification (read-only)
+- Shared connection pooling and backup infrastructure
+
+**How to run:**
+```bash
+# Via Docker
+docker run -d --name mysql8 \
+  -p 3306:3306 \
+  -e MYSQL_ROOT_PASSWORD=password \
+  mysql:8.0
+```
+
+**Schema setup:**
+```sql
+-- Create PAW's dedicated schema
+CREATE DATABASE paw_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- Grant PAW service user access
+CREATE USER 'paw_service'@'%' IDENTIFIED BY 'paw_password';
+GRANT ALL PRIVILEGES ON paw_db.* TO 'paw_service'@'%';
+
+-- Grant read-only access to ELP's schema (for member lookup)
+GRANT SELECT ON endeavour_ods.ods_member TO 'paw_service'@'%';
+GRANT SELECT ON endeavour_ods.ods_programme TO 'paw_service'@'%';
+```
+
+**PAW configuration:**
+```properties
+# paw-application.properties
+spring.datasource.url=jdbc:mysql://localhost:3306/paw_db
+spring.datasource.username=paw_service
+spring.datasource.password=paw_password
+spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
+
+# Flyway for schema migrations
+spring.flyway.enabled=true
+spring.flyway.locations=classpath:db/migration
+```
+
+---
+
+### Optional ELP Modules (Recommended for Full Integration)
+
+#### 5. `endeavour-gateway` — External System Integration
+
+**What it is:** Gateway service for receiving events from external systems (CRM, POS, etc.)
+
+**Why PAW might need it:**
+- In production, sales events come from Salesforce/CRM via Gateway
+- Gateway validates, transforms, and publishes to ActiveMQ
+- PAW listens to these events
+
+**For Sprint 2:** Not required. Use PAW's test endpoint instead:
+```
+POST /api/v1/test/simulate-sale
+```
+
+**For production:** Configure Gateway Provider for the CRM system.
+
+---
+
+#### 6. `endeavour-marketing` — Rules Engine (Drools)
+
+**What it is:** The Drools-based Marketing Unit execution engine
+
+**Why PAW needs it:**
+- Executes the custom "PAW Sales Commission" MU
+- Calculates manager bonuses based on hierarchy roll-up
+- Awards points to the chain
+
+**How it integrates:**
+- Drools is embedded in `endeavour-application`, not a separate service
+- PAW's Terminal Event triggers the MU via Apache Camel routing
+- The custom MU is deployed as a `.drl` file in `endeavour-marketing` module
+
+**Custom MU file location:**
+```
+endeavour-marketing/src/main/resources/rules/paw-commission-v1.drl
+```
+
+---
+
+#### 7. MongoDB + `endeavour-event-hub` — Event Persistence
+
+**What it is:** Event Hub service that persists all events to MongoDB for audit/reporting
+
+**Why PAW might need it:**
+- All Terminal Events are automatically persisted
+- Historical reporting: "Show all commission events for Dave in Q1"
+- Audit trail for compliance
+
+**How to run:**
+```bash
+# Via Docker
+docker run -d --name mongo \
+  -p 27017:27017 \
+  mongo:4.4
+```
+
+**Not required for Sprint 2** — but recommended for production.
+
+---
+
+### PAW's Own Modules (What We Build)
+
+PAW consists of these modules, built using ELP's platform libraries:
+
+```
+paw-parent/
+├── pom.xml                          → Parent POM, inherits from endeavour-platform
+├── paw-data/                        → JPA entities, Flyway migrations
+├── paw-graph-engine/                → Closure table manager, hierarchy logic
+├── paw-api/                         → RESTEasy endpoints
+├── paw-elp-bridge/                  → ActiveMQ listeners, event publishers
+├── paw-application/                 → Main Spring Boot app (or Spring XML like ELP)
+└── paw-admin-ui/ (optional)         → Backbone.js or React admin portal
+```
+
+**Parent POM dependency:**
+```xml
+<parent>
+    <groupId>com.ga.endeavour.platform</groupId>
+    <artifactId>endeavour-platform</artifactId>
+    <version>21.2.17-SNAPSHOT</version>
+</parent>
+```
+
+This gives PAW access to:
+- `endeavour-commons-rest` — REST framework utilities
+- `endeavour-platform-event` — Event DTOs
+- `endeavour-commons-jms` — ActiveMQ integration
+- `endeavour-platform-validation` — Validation framework
+- `endeavour-commons-security` — OAuth2 security interceptors
+
+---
+
+### Development Environment: Running Everything Together
+
+#### Step 1: Start Infrastructure (Docker)
+
+```bash
+cd /Users/macbookpro/aimia/infrastructure/dev-env-setup
+./buildAllTheThings.sh
+# This starts: MySQL, MongoDB, ActiveMQ, Solr
+```
+
+#### Step 2: Populate ELP Database
+
+```bash
+cd /Users/macbookpro/aimia/infrastructure/dev-env-setup
+./populate_mysql.sh
+# Creates endeavour_ods schema, seed data
+```
+
+#### Step 3: Start ELP Identity Service
+
+```bash
+cd /Users/macbookpro/aimia/infrastructure/endeavour-identity/endeavour-identity
+mvn jetty:run
+# Wait for: "Started Jetty Server" on port 8911
+```
+
+#### Step 4: Start ELP Application Service
+
+```bash
+cd /Users/macbookpro/aimia/infrastructure/endeavour-application/endeavour-application-web
+mvn jetty:run
+# Wait for: "Started Jetty Server" on port 8910
+```
+
+#### Step 5: Create PAW Database Schema
+
+```bash
+mysql -h localhost -u root -ppassword -e "CREATE DATABASE paw_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+```
+
+#### Step 6: Start PAW Service
+
+```bash
+cd /Users/macbookpro/aimia/paw/paw-application
+mvn spring-boot:run
+# Or: mvn jetty:run (if using ELP's Jetty pattern)
+# Runs on http://localhost:8920
+```
+
+#### Step 7: Verify All Services
+
+```bash
+# Check ELP Identity
+curl http://localhost:8911/health
+# → {"status":"UP"}
+
+# Check ELP Application
+curl http://localhost:8910/health
+# → {"status":"UP"}
+
+# Check PAW
+curl http://localhost:8920/api/v1/health
+# → {"status":"UP","database":"connected","activemq":"connected"}
+
+# Check ActiveMQ
+open http://localhost:8161/admin
+# Login: admin/admin, verify queues exist
+```
+
+---
+
+### Production Deployment: Service Topology
+
+In production, PAW and ELP run on separate EC2 instances but share infrastructure:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    AWS VPC (Private)                    │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  ┌──────────────┐      ┌──────────────┐               │
+│  │ ELP Identity │      │ ELP App      │               │
+│  │ (EC2)        │      │ (EC2 x 4)    │               │
+│  │ Port: 8911   │      │ Port: 8910   │               │
+│  └──────┬───────┘      └──────┬───────┘               │
+│         │                     │                        │
+│         └──────┬──────────────┘                        │
+│                │                                        │
+│         ┌──────▼───────┐      ┌──────────────┐        │
+│         │ RDS MySQL    │      │ PAW Service  │        │
+│         │ (Multi-AZ)   │      │ (EC2 x 2)    │        │
+│         │ Port: 3306   │      │ Port: 8920   │        │
+│         └──────┬───────┘      └──────┬───────┘        │
+│                │                     │                 │
+│         ┌──────▼─────────────────────▼───────┐        │
+│         │      Amazon MQ (ActiveMQ)          │        │
+│         │      Port: 61617 (SSL)             │        │
+│         └────────────────────────────────────┘        │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+              ┌──────────────────┐
+              │ Application Load │
+              │ Balancer (ALB)   │
+              └──────────────────┘
+                         │
+                         ▼
+                    Internet
+```
+
+**Key points:**
+- PAW and ELP share the same RDS MySQL instance (different schemas)
+- PAW and ELP share the same Amazon MQ (ActiveMQ) cluster
+- PAW calls ELP Identity for token validation (internal VPC traffic)
+- PAW publishes events to ActiveMQ, ELP consumes them
+- ALB routes `/api/v1/hierarchy/*` → PAW, everything else → ELP
+
+---
+
+### Maven Dependency Management
+
+PAW's `pom.xml` imports ELP platform libraries:
+
+```xml
+<dependencies>
+    <!-- ELP Platform Base -->
+    <dependency>
+        <groupId>com.ga.endeavour.platform</groupId>
+        <artifactId>endeavour-commons-rest</artifactId>
+        <version>${elp.version}</version>
+    </dependency>
+    
+    <!-- Event Framework -->
+    <dependency>
+        <groupId>com.ga.endeavour.platform</groupId>
+        <artifactId>endeavour-platform-event</artifactId>
+        <version>${elp.version}</version>
+    </dependency>
+    
+    <!-- ActiveMQ Integration -->
+    <dependency>
+        <groupId>com.ga.endeavour.platform</groupId>
+        <artifactId>endeavour-commons-jms</artifactId>
+        <version>${elp.version}</version>
+    </dependency>
+    
+    <!-- Security (OAuth2 token validation) -->
+    <dependency>
+        <groupId>com.ga.endeavour.platform</groupId>
+        <artifactId>endeavour-commons-security</artifactId>
+        <version>${elp.version}</version>
+    </dependency>
+    
+    <!-- Validation Framework -->
+    <dependency>
+        <groupId>com.ga.endeavour.platform</groupId>
+        <artifactId>endeavour-platform-validation</artifactId>
+        <version>${elp.version}</version>
+    </dependency>
+    
+    <!-- Standard Spring/Hibernate (same versions as ELP) -->
+    <dependency>
+        <groupId>org.springframework</groupId>
+        <artifactId>spring-context</artifactId>
+        <version>4.3.18.RELEASE</version>
+    </dependency>
+    
+    <dependency>
+        <groupId>org.hibernate</groupId>
+        <artifactId>hibernate-core</artifactId>
+        <version>5.2.17.Final</version>
+    </dependency>
+</dependencies>
+```
+
+**Version alignment:** PAW uses the **exact same versions** of Spring, Hibernate, Jackson, and ActiveMQ as ELP to avoid classpath conflicts.
+
+---
+
+### Configuration Files PAW Needs
+
+#### `paw-application.properties`
+```properties
+# Server
+server.port=8920
+server.servlet.context-path=/
+
+# Database
+spring.datasource.url=jdbc:mysql://localhost:3306/paw_db
+spring.datasource.username=paw_service
+spring.datasource.password=${PAW_DB_PASSWORD}
+spring.jpa.hibernate.ddl-auto=validate
+spring.flyway.enabled=true
+
+# ActiveMQ
+spring.activemq.broker-url=tcp://localhost:61616
+spring.activemq.user=admin
+spring.activemq.password=admin
+
+# ELP Integration
+elp.identity.url=http://localhost:8911
+elp.identity.client-id=paw-hierarchy-service
+elp.identity.client-secret=${PAW_CLIENT_SECRET}
+elp.application.url=http://localhost:8910
+
+# PAW Specific
+paw.closure.rebuild-threshold=100
+paw.reorg.table-swap-threshold=500
+paw.api.rate-limit=1000
+```
+
+#### `logback.xml` (same pattern as ELP)
+```xml
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+    
+    <logger name="com.ga.paw" level="DEBUG"/>
+    <logger name="com.ga.endeavour" level="INFO"/>
+    
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>
+```
+
+---
+
+### Summary: What Needs to Be Running
+
+| Service | Port | Required for PAW? | Purpose |
+|---|---|---|---|
+| MySQL | 3306 | ✅ YES | PAW's database + ELP member lookup |
+| ActiveMQ | 61616 | ✅ YES | Event bus for Terminal Events |
+| ELP Identity | 8911 | ✅ YES | OAuth2 token validation |
+| ELP Application | 8910 | ✅ YES | Receives Terminal Events, executes Drools |
+| PAW Service | 8920 | ✅ YES | The PAW hierarchy service itself |
+| MongoDB | 27017 | ⚠️ Optional | Event persistence (audit trail) |
+| ELP Gateway | 8912 | ⚠️ Optional | CRM integration (use test endpoint for Sprint 2) |
+| Solr | 8983 | ❌ NO | Search (not used by PAW) |
+
+**Minimum viable stack for Sprint 2 demo:** MySQL + ActiveMQ + ELP Identity + ELP Application + PAW Service.
+
+---
+
+## 15. Reference Implementation: `avis-unlimited-rewards` — What It Is & What PAW Can Learn
+
+> This section analyzes the `avis-unlimited-rewards` repo found at `/infrastructure/avis-unlimited-rewards`. **This is NOT PAW.** It is an existing client-specific customization of ELP for the Avis Budget Group / Hilton "Unlimited Rewards" loyalty program. It serves as a **real-world reference** for how to extend ELP with custom functionality — exactly the pattern PAW needs to follow.
+
+---
+
+### What Is Avis Unlimited Rewards?
+
+**Simple version:** Avis Budget Group (the car rental company) and Hilton (the hotel chain) run a joint loyalty program called "Unlimited Rewards" on top of ELP. When a member rents a car from Avis/Budget or stays at a Hilton hotel, they earn points. This repo contains all the custom code that makes that specific program work — the data imports, the billing calculations, the commission rates, and the custom API endpoints.
+
+**Technical version:** `avis-unlimited-rewards` is a **client plugin project** that extends ELP via its documented plugin architecture. It does NOT modify ELP's core code. Instead, it:
+1. Plugs into `endeavour-application` via an **application-plugin** JAR
+2. Plugs into `endeavour-gateway` via a **gateway-plugin** JAR (Gateway Provider)
+3. Plugs into `endeavour-batch` via a **batch-plugin** JAR (custom batch jobs)
+4. Has its own database schema (`avisur`) with client-specific tables
+
+---
+
+### Module Breakdown
+
+```
+avis-unlimited-rewards/
+├── pom.xml                              → Parent POM, inherits from endeavour-parent
+│                                           groupId: com.ga.endeavour.client.avisur
+│                                           version: 1.28-SNAPSHOT
+│                                           platform version: 21.0.6-REL
+│
+├── endeavour-avisur-common/             → Shared code, DB migrations, Spring config
+│   ├── src/main/migrations/             → SQL migrations for client-specific tables
+│   │   ├── 001_create_table_delta_extract.sql  → Tracks batch extract runs
+│   │   ├── 002_insert_hilton_program_properties.sql → Hilton commission rates
+│   │   └── 003_insert_cr002_feature_config.sql → Booking interaction field config
+│   └── src/main/resources/              → Spring XML configs, property files
+│
+├── endeavour-avisur-application-plugin/ → Custom REST endpoints for Avis
+│   ├── AuthenticationResource.java      → RSA public key management for mobile app
+│   ├── MemberEnrollmentResource.java    → Custom member registration with email encryption
+│   ├── MemberAuthResource.java          → Custom mobile app authentication
+│   ├── ForgotPasswordResource.java      → Password reset flow
+│   └── custom-resources-plugin.xml      → Spring config that registers these endpoints
+│
+├── endeavour-avisur-batch/              → Custom batch jobs for data processing
+│   ├── scripts/                         → 30+ shell scripts for scheduled jobs:
+│   │   ├── load-avis-rental-transaction-inbound-job.sh
+│   │   ├── load-budget-rental-transaction-inbound-job.sh
+│   │   ├── load-hilton-stays-transaction-inbound-job.sh
+│   │   ├── extract-billing-details-avis-outbound-job.sh
+│   │   ├── extract-hilton-commission-summary-outbound-job.sh
+│   │   └── ... (invoices, data warehouse extracts, segment deltas)
+│   └── src/main/java/                   → Java batch processors, converters, readers/writers
+│       ├── AvisRentalFileConstants.java → Rental transaction fields (agentNumber, IATA, etc.)
+│       ├── HiltonAdminFeeConverter.java → Commission fee calculations
+│       └── TransactionQueryBuilderHelper.java → SQL query builders for data extracts
+│
+├── endeavour-avisur-datamart/           → Gateway Provider plugin
+│   ├── BookingInteractionFeature.java   → Defines "GenericBookingInteraction" type
+│   ├── provider-avisur.xml              → Registers "UnlimitedRewardsAdapter" as a Gateway Provider
+│   └── generic-booking-transaction-descriptor.xml → Interaction field mappings
+│       (Brand, Length of Activity, Special Equipment, Country Code,
+│        Booking Date, Checkout Date, Property Code, Rate Plan Type/Code)
+│
+└── endeavour-avisur-distribution/       → Packaging module (RPM build for deployment)
+    └── Assembles all plugins into deployable artifacts
+```
+
+---
+
+### How It Extends ELP (The Plugin Pattern)
+
+This is the critical insight. Avis Unlimited Rewards **does not fork ELP**. It uses ELP's plugin architecture:
+
+#### 1. Application Plugin (Custom REST Endpoints)
+
+The `application-plugin` JAR gets dropped into `endeavour-application`'s classpath. The file `custom-resources-plugin.xml` is auto-discovered by Spring and registers new JAX-RS resources:
+
+```java
+// Extends ELP's REST API with client-specific endpoints
+@Component
+@Path("/client/programs/{programCode}/members")
+public class MemberEnrollmentResource {
+    // Uses ELP's MemberOperations mediator directly
+    @Autowired
+    private MemberOperations memberMediator;
+    
+    // Custom enrollment with RSA email encryption
+    @POST
+    public Response addNewMember(...) {
+        decryptEmailSecondaryToken(memberRequest.getTokens());
+        Member member = memberMediator.create(memberRequest, sharingCode);
+        return Response.created(uri).build();
+    }
+}
+```
+
+**Key pattern:** The plugin uses `@Path("/client/...")` prefix to avoid conflicting with ELP's built-in `/programs/...` endpoints. It autowires ELP's core services (`MemberOperations`) directly.
+
+#### 2. Gateway Provider (External Data Ingestion)
+
+The `datamart` module registers a Gateway Provider called `UnlimitedRewardsAdapter` that defines how external booking data from Avis/Budget/Hilton is ingested:
+
+```xml
+<bean name="UnlimitedRewardsAdapter" class="com.ga.endeavour.gateway.domain.Provider">
+    <property name="features">
+        <list>
+            <ref bean="genericURInteractionFeature"/>
+        </list>
+    </property>
+</bean>
+```
+
+This tells ELP Gateway: "When booking data arrives for the UNLIMITED program, parse it using these field definitions (Brand, Checkout Date, Property Code, etc.) and create a `GenericBookingInteraction`."
+
+#### 3. Batch Jobs (Data Processing Pipelines)
+
+30+ batch scripts handle:
+- **Inbound:** Load rental transactions from Avis, Budget car rentals and Hilton hotel stays
+- **Outbound:** Extract billing details, commission summaries, invoices, data warehouse exports
+- **Internal:** Segment delta processing, AWD/BCD exclusion lists (corporate discount codes)
+
+#### 4. Client-Specific Database Schema
+
+The `avisur` schema has its own tables:
+- `ur_delta_extracts` — Tracks when batch extracts last ran (for incremental processing)
+- Program properties in ELP's `admin_program_property` table for Hilton commission rates:
+  - `hilton.stayTypeName1` = "Homewood Suites" → base commission 0.47, bonus 0.97
+  - `hilton.stayTypeName2` = "Weekend Stay" → base 0.73, bonus 0.73
+  - etc.
+
+---
+
+### Is This PAW? **No.**
+
+| Aspect | Avis Unlimited Rewards | PAW |
+|---|---|---|
+| **Purpose** | Client-specific loyalty program customization (car rentals + hotel stays → points) | Generic B2B hierarchy engine (org charts, manager chains, commission roll-ups) |
+| **Architecture** | Plugin JARs dropped into ELP's existing services | Standalone sidecar service with its own Jetty instance |
+| **Database** | Uses ELP's ODS + small client-specific schema | Own separate database (`paw_db`) with 6 tables |
+| **REST API** | Extends ELP's API with `/client/...` prefix | Entirely new API on separate port (8920) |
+| **Batch** | Heavy batch processing (30+ scheduled jobs) | Minimal batch (Table Swap only) |
+| **Gateway** | Registers as Gateway Provider for booking data | Listens to events, doesn't register as Provider |
+| **Reusable?** | No — specific to Avis/Budget/Hilton | Yes — any client with a sales hierarchy |
+| **Hierarchy?** | None — flat member model only | Core feature — DAG with closure table |
+
+---
+
+### What PAW Should Learn From This Repo
+
+#### Lesson 1: The Plugin Architecture Is the Proven Extension Path
+
+Avis UR extends ELP via **plugin JARs** — not forks, not microservices. This is ELP's officially supported extension pattern. PAW should evaluate whether some components (especially the Drools custom MU) should be delivered as an **application-plugin** JAR rather than relying purely on ActiveMQ events.
+
+**Implication for PAW:**
+- The custom `PAW_AWARD` Drools MU (`.drl` file) should be packaged as an **application-plugin** JAR, just like Avis UR does
+- This plugin gets deployed into `endeavour-application`'s classpath
+- It uses `custom-resources-plugin.xml` to register with Spring
+
+#### Lesson 2: The `/client/` API Prefix Convention
+
+Avis UR uses `@Path("/client/programs/{programCode}/...")` to namespace client-specific endpoints. If PAW ever needs to add endpoints inside ELP's application (not just the sidecar), it should follow this convention:
+
+```java
+@Path("/client/programs/{programCode}/hierarchy")
+```
+
+#### Lesson 3: Database Migrations via SQL Scripts
+
+Avis UR uses numbered SQL migration files (`001_create_table...`, `002_insert...`). PAW should follow the same pattern with Flyway:
+```
+paw-data/src/main/resources/db/migration/
+├── V001__create_paw_tenant.sql
+├── V002__create_paw_identity.sql
+├── V003__create_paw_org_unit.sql
+├── V004__create_paw_membership.sql
+├── V005__create_paw_reporting_line.sql
+├── V006__create_paw_closure.sql
+└── V007__seed_acme_corp_test_data.sql
+```
+
+#### Lesson 4: Gateway Provider for External Data
+
+Avis UR registers a `Provider` with ELP Gateway to ingest booking data. PAW could use the same pattern to ingest HR/CRM data:
+
+```xml
+<bean name="PawHierarchyAdapter" class="com.ga.endeavour.gateway.domain.Provider">
+    <property name="features">
+        <list>
+            <ref bean="orgChangeInteractionFeature"/>
+        </list>
+    </property>
+</bean>
+```
+
+This would allow HR systems (Workday, SAP SuccessFactors) to push org chart changes directly through ELP Gateway into PAW.
+
+#### Lesson 5: The Distribution Module (Packaging)
+
+Avis UR has an `endeavour-avisur-distribution` module that packages all plugins into RPMs for deployment. PAW should have a similar module:
+
+```
+paw-distribution/
+├── pom.xml
+└── Packages: application-plugin JAR + batch-plugin JAR + gateway-plugin JAR + standalone WAR
+```
+
+#### Lesson 6: Commission Rates Are Program Properties
+
+Avis UR stores Hilton commission rates in `admin_program_property` — ELP's existing configuration table. PAW's commission percentages (e.g., "manager gets 50%, director gets 25%") should also go here:
+
+```sql
+INSERT INTO ods.admin_program_property (program_code, property_name, property_value)
+VALUES ('ACME_LOYALTY', 'paw.commission.level1.percentage', '50');
+INSERT INTO ods.admin_program_property (program_code, property_name, property_value)
+VALUES ('ACME_LOYALTY', 'paw.commission.level2.percentage', '25');
+```
+
+This means commission rules can be changed via Configuration Web without any code changes.
+
+---
+
+### Revised PAW Architecture: Hybrid Plugin + Sidecar
+
+Based on the Avis UR reference, PAW's architecture should actually be a **two-part deployment**:
+
+```
+PART 1: PAW Sidecar (Standalone Service — Port 8920)
+├── paw-data           → JPA entities, Flyway migrations for paw_db
+├── paw-graph-engine   → Closure table, DAG validation, hierarchy resolution
+├── paw-api            → PAW's own REST endpoints (hierarchy queries, admin)
+├── paw-elp-bridge     → ActiveMQ listener/publisher
+└── paw-application    → Jetty-hosted Spring application
+
+PART 2: PAW ELP Plugin (Dropped into endeavour-application)
+├── paw-drools-plugin  → Custom PAW_AWARD MU (.drl files)
+│   └── Packaged as application-plugin JAR
+├── paw-gateway-plugin → Gateway Provider for HR/CRM org data
+│   └── Packaged as gateway-plugin JAR
+└── paw-batch-plugin   → Scheduled hierarchy sync jobs (optional)
+    └── Packaged as batch-plugin JAR
+```
+
+**This is the key insight from Avis UR:** PAW is not purely a sidecar. The Drools rules and Gateway Provider MUST live inside ELP as plugin JARs, because that's how ELP's plugin architecture works. The sidecar handles the hierarchy logic, but the ELP integration points are delivered as plugins.
+
+---
+
+### Summary
+
+`avis-unlimited-rewards` is a **production client implementation** that proves ELP's plugin architecture works for extending the platform with custom business logic. It is NOT PAW, but it is the **closest existing reference** for how PAW should integrate with ELP. The key takeaway is that PAW should be a **hybrid: sidecar service + ELP plugin JARs**, not purely one or the other.
+
+---
+
+*End of PAW Design Document*
